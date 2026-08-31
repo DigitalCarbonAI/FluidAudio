@@ -71,6 +71,10 @@ public struct PhraseBoostingContext: Sendable {
     struct Selection: Sendable {
         let token: Int
         let nextState: Int
+        /// Acoustic-model probability for a replacement token. The optimized
+        /// joint's probability remains authoritative when TurboBias keeps its
+        /// original token.
+        let replacementProbability: Float?
     }
 
     private struct Transition: Sendable {
@@ -155,7 +159,11 @@ public struct PhraseBoostingContext: Sendable {
         }
         guard fusionDisabled || baseAlreadyHasMaximumReward || probabilityProvesBaseCannotLose
         else { return nil }
-        return Selection(token: baseToken, nextState: baseTransition.nextState)
+        return Selection(
+            token: baseToken,
+            nextState: baseTransition.nextState,
+            replacementProbability: nil
+        )
     }
 
     init(
@@ -414,12 +422,16 @@ public struct PhraseBoostingContext: Sendable {
     /// The caller enforces that blank-category decision before invoking this method.
     func select(baseToken: Int, acousticScores: [Float], state: Int) -> Selection {
         guard baseToken >= 0, baseToken < blankID, baseToken < acousticScores.count else {
-            return Selection(token: baseToken, nextState: state)
+            return Selection(token: baseToken, nextState: state, replacementProbability: nil)
         }
 
         let baseTransition = transition(from: state, token: baseToken)
         guard config.alpha > 0 else {
-            return Selection(token: baseToken, nextState: baseTransition.nextState)
+            return Selection(
+                token: baseToken,
+                nextState: baseTransition.nextState,
+                replacementProbability: nil
+            )
         }
         var bestToken = baseToken
         var bestTransition = baseTransition
@@ -441,7 +453,40 @@ public struct PhraseBoostingContext: Sendable {
                 bestScore = candidateScore
             }
         }
-        return Selection(token: bestToken, nextState: bestTransition.nextState)
+        let replacementProbability =
+            bestToken == baseToken
+            ? nil
+            : tokenProbability(for: bestToken, acousticScores: acousticScores)
+        return Selection(
+            token: bestToken,
+            nextState: bestTransition.nextState,
+            replacementProbability: replacementProbability
+        )
+    }
+
+    /// RNNTJoint may normalize token and duration logits together, while the
+    /// optimized JointDecision model reports a token-only softmax probability.
+    /// Renormalizing through the blank token keeps replacement confidences on
+    /// the same scale as the primary decoder without rerunning either model.
+    private func tokenProbability(for token: Int, acousticScores: [Float]) -> Float? {
+        let tokenCount = min(blankID + 1, acousticScores.count)
+        guard token >= 0, token < tokenCount else { return nil }
+
+        var maximum = -Float.infinity
+        for index in 0..<tokenCount {
+            maximum = max(maximum, acousticScores[index])
+        }
+        guard maximum.isFinite else { return nil }
+
+        var denominator = 0.0
+        for index in 0..<tokenCount {
+            denominator += Foundation.exp(Double(acousticScores[index] - maximum))
+        }
+        guard denominator.isFinite, denominator > 0 else { return nil }
+
+        return Float(
+            Foundation.exp(Double(acousticScores[token] - maximum)) / denominator
+        )
     }
 
     func matchingPhrases(in tokens: [Int]) -> [String] {

@@ -380,6 +380,9 @@ internal struct TdtDecoderV3: Sendable {
             ) {
                 label = selection.token
                 selectedPhraseState = selection.nextState
+                if let replacementProbability = selection.replacementProbability {
+                    score = TdtDurationMapping.clampProbability(replacementProbability)
+                }
             }
 
             // Map duration bin to actual frame count
@@ -479,6 +482,9 @@ internal struct TdtDecoderV3: Sendable {
                 ) {
                     label = selection.token
                     selectedPhraseState = selection.nextState
+                    if let replacementProbability = selection.replacementProbability {
+                        score = TdtDurationMapping.clampProbability(replacementProbability)
+                    }
                 }
 
                 duration = try TdtDurationMapping.mapDurationBin(
@@ -624,7 +630,7 @@ internal struct TdtDecoderV3: Sendable {
                 )
 
                 var token = decision.token
-                let score = TdtDurationMapping.clampProbability(decision.probability)
+                var score = TdtDurationMapping.clampProbability(decision.probability)
 
                 var finalPhraseState = phraseState
                 if let selection = selectPhraseToken(
@@ -635,6 +641,9 @@ internal struct TdtDecoderV3: Sendable {
                 ) {
                     token = selection.token
                     finalPhraseState = selection.nextState
+                    if let replacementProbability = selection.replacementProbability {
+                        score = TdtDurationMapping.clampProbability(replacementProbability)
+                    }
                 }
 
                 // Also get duration for proper timestamp calculation

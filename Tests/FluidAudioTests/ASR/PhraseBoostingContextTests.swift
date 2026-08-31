@@ -194,6 +194,42 @@ final class PhraseBoostingContextTests: XCTestCase {
         )
     }
 
+    func testReplacementReportsTokenOnlyAcousticProbability() throws {
+        let context = try PhraseBoostingContext(
+            phrases: ["codex"],
+            vocabulary: vocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig(alpha: 1)
+        )
+        let replacementToken = try XCTUnwrap(context.tokenizedPhrases[0].first)
+        var scores = Array(repeating: Float(-100), count: 1_030)
+        scores[7] = 0
+        scores[replacementToken] = -0.5
+        scores[1_024] = -1
+
+        let replacement = context.select(
+            baseToken: 7,
+            acousticScores: scores,
+            state: context.rootState
+        )
+        let expected = Float(
+            Foundation.exp(-0.5)
+                / (Foundation.exp(0) + Foundation.exp(-0.5) + Foundation.exp(-1))
+        )
+
+        XCTAssertEqual(replacement.token, replacementToken)
+        XCTAssertEqual(try XCTUnwrap(replacement.replacementProbability), expected, accuracy: 1e-6)
+
+        scores[replacementToken] = -10
+        let unchanged = context.select(
+            baseToken: 7,
+            acousticScores: scores,
+            state: context.rootState
+        )
+        XCTAssertEqual(unchanged.token, 7)
+        XCTAssertNil(unchanged.replacementProbability)
+    }
+
     func testLowercasePhraseAlsoMatchesTitleCaseTokensForParakeetV2() throws {
         let context = try PhraseBoostingContext(
             phrases: ["codex"],
