@@ -6,7 +6,7 @@ import Foundation
 /// TurboBias calls this only after the optimized joint has selected a non-blank
 /// category. Keeping all inputs and output storage alive for the decode avoids a
 /// per-token Core ML feature-provider/tensor allocation cycle.
-internal final class PhraseBoostingJointWorkspace: @unchecked Sendable {
+internal final class PhraseBoostingJointWorkspace {
     private let encoderStep: MLMultiArray
     private let decoderStep: MLMultiArray
     private let logitsBacking: MLMultiArray

@@ -86,6 +86,26 @@ public struct ASRConfig: Sendable {
 
 // MARK: - Results
 
+/// Why optional TurboBias phrase fusion stopped during an otherwise successful decode.
+public enum PhraseBoostingFailureReason: String, Codable, Sendable {
+    /// Reusable tensor allocation failed, usually because the process was under memory pressure.
+    case workspaceUnavailable
+    /// A phrase context reached a decoder that did not have the optional full-vocabulary joint.
+    case jointUnavailable
+    /// Core ML rejected a prediction from the loaded full-vocabulary joint.
+    case predictionFailed
+
+    /// Failures that warrant verifying the optional model assets before the next decode.
+    public var requiresResourceRepair: Bool {
+        switch self {
+        case .workspaceUnavailable:
+            false
+        case .jointUnavailable, .predictionFailed:
+            true
+        }
+    }
+}
+
 public struct ASRResult: Codable, Sendable {
     public let text: String
     public let confidence: Float
@@ -100,6 +120,9 @@ public struct ASRResult: Codable, Sendable {
     /// `true` when optional phrase fusion stopped but primary ASR continued.
     /// Nil means phrase fusion was not requested, preserving older encoded results.
     public let phraseBoostingFailed: Bool?
+    /// Typed failure provenance for callers deciding whether model assets need repair.
+    /// Optional so results encoded before TurboBias recovery metadata continue to decode.
+    public let phraseBoostingFailureReason: PhraseBoostingFailureReason?
 
     public init(
         text: String, confidence: Float, duration: TimeInterval, processingTime: TimeInterval,
@@ -108,7 +131,8 @@ public struct ASRResult: Codable, Sendable {
         ctcDetectedTerms: [String]? = nil,
         ctcAppliedTerms: [String]? = nil,
         phraseBoostedTerms: [String]? = nil,
-        phraseBoostingFailed: Bool? = nil
+        phraseBoostingFailed: Bool? = nil,
+        phraseBoostingFailureReason: PhraseBoostingFailureReason? = nil
     ) {
         self.text = text
         self.confidence = confidence
@@ -119,7 +143,8 @@ public struct ASRResult: Codable, Sendable {
         self.ctcDetectedTerms = ctcDetectedTerms
         self.ctcAppliedTerms = ctcAppliedTerms
         self.phraseBoostedTerms = phraseBoostedTerms
-        self.phraseBoostingFailed = phraseBoostingFailed
+        self.phraseBoostingFailed = phraseBoostingFailureReason == nil ? phraseBoostingFailed : true
+        self.phraseBoostingFailureReason = phraseBoostingFailureReason
     }
 
     /// Real-time factor (RTFx) - how many times faster than real-time
@@ -145,7 +170,8 @@ public struct ASRResult: Codable, Sendable {
             ctcDetectedTerms: detected,
             ctcAppliedTerms: applied,
             phraseBoostedTerms: phraseBoostedTerms,
-            phraseBoostingFailed: phraseBoostingFailed
+            phraseBoostingFailed: phraseBoostingFailed,
+            phraseBoostingFailureReason: phraseBoostingFailureReason
         )
     }
 }

@@ -37,7 +37,7 @@ extension AsrManager {
                 audioSamples: audioSamples,
                 processingTime: Date().timeIntervalSince(startTime),
                 phraseBoosting: phraseBoosting,
-                phraseBoostingFailed: hypothesis.phraseBoostingFailed
+                phraseBoostingFailureReason: hypothesis.phraseBoostingFailureReason
             )
 
             return result
@@ -108,10 +108,10 @@ extension AsrManager {
         audioSamples: [Float],
         processingTime: TimeInterval,
         phraseBoosting: PhraseBoostingContext? = nil,
-        phraseBoostingFailed: Bool = false
+        phraseBoostingFailureReason: PhraseBoostingFailureReason? = nil
     ) -> ASRResult {
 
-        let effectivePhraseBoosting = phraseBoostingFailed ? nil : phraseBoosting
+        let effectivePhraseBoosting = phraseBoostingFailureReason == nil ? phraseBoosting : nil
         let text =
             effectivePhraseBoosting?.formattedText(in: tokenIds, vocabulary: vocabulary)
             ?? convertTokensToText(tokenIds)
@@ -133,7 +133,8 @@ extension AsrManager {
             processingTime: processingTime,
             tokenTimings: resultTimings,
             phraseBoostedTerms: effectivePhraseBoosting?.matchingPhrases(in: tokenIds),
-            phraseBoostingFailed: phraseBoosting == nil ? nil : phraseBoostingFailed
+            phraseBoostingFailed: phraseBoosting == nil ? nil : phraseBoostingFailureReason != nil,
+            phraseBoostingFailureReason: phraseBoostingFailureReason
         )
     }
 

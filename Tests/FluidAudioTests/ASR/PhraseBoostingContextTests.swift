@@ -492,11 +492,18 @@ final class PhraseBoostingContextTests: XCTestCase {
             confidence: 1,
             duration: 1,
             processingTime: 0.1,
-            phraseBoostingFailed: true
+            phraseBoostingFailureReason: .predictionFailed
         )
 
         let copied = failed.withRescoring(text: "Codex", detected: nil, applied: nil)
 
         XCTAssertEqual(copied.phraseBoostingFailed, true)
+        XCTAssertEqual(copied.phraseBoostingFailureReason, .predictionFailed)
+    }
+
+    func testOnlyJointFailuresRequestOptionalResourceRepair() {
+        XCTAssertFalse(PhraseBoostingFailureReason.workspaceUnavailable.requiresResourceRepair)
+        XCTAssertTrue(PhraseBoostingFailureReason.jointUnavailable.requiresResourceRepair)
+        XCTAssertTrue(PhraseBoostingFailureReason.predictionFailed.requiresResourceRepair)
     }
 }

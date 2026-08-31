@@ -10,7 +10,7 @@ struct ChunkProcessor {
         let index: Int
         let tokens: [TokenWindow]
         let workerIndex: Int
-        let phraseBoostingFailed: Bool
+        let phraseBoostingFailureReason: PhraseBoostingFailureReason?
     }
     private struct IndexedToken {
         let index: Int
@@ -504,7 +504,7 @@ struct ChunkProcessor {
 
                     let (
                         windowTokens, windowTimestamps, windowConfidences, windowDurations,
-                        phraseBoostingFailed
+                        phraseBoostingFailureReason
                     ) =
                         try await Self
                         .transcribeChunk(
@@ -542,7 +542,7 @@ struct ChunkProcessor {
                         index: index,
                         tokens: windowData,
                         workerIndex: workerIndex,
-                        phraseBoostingFailed: phraseBoostingFailed
+                        phraseBoostingFailureReason: phraseBoostingFailureReason
                     )
                 }
                 inFlight += 1
@@ -578,7 +578,10 @@ struct ChunkProcessor {
 
         let orderedResults = chunkOutputs.compactMap { $0 }
         let orderedChunkOutputs = orderedResults.map(\.tokens)
-        let phraseBoostingFailed = orderedResults.contains { $0.phraseBoostingFailed }
+        let phraseBoostingFailures = orderedResults.compactMap(\.phraseBoostingFailureReason)
+        let phraseBoostingFailureReason =
+            phraseBoostingFailures.first(where: \.requiresResourceRepair)
+            ?? phraseBoostingFailures.first
 
         guard var mergedTokens = orderedChunkOutputs.first else {
             return await manager.processTranscriptionResult(
@@ -626,7 +629,7 @@ struct ChunkProcessor {
             audioSamples: [],
             processingTime: Date().timeIntervalSince(startTime),
             phraseBoosting: phraseBoosting,
-            phraseBoostingFailed: phraseBoostingFailed
+            phraseBoostingFailureReason: phraseBoostingFailureReason
         )
     }
 
@@ -668,9 +671,9 @@ struct ChunkProcessor {
         initialTimeIndexOverride: Int? = nil
     ) async throws -> (
         tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int],
-        phraseBoostingFailed: Bool
+        phraseBoostingFailureReason: PhraseBoostingFailureReason?
     ) {
-        guard !samples.isEmpty else { return ([], [], [], [], false) }
+        guard !samples.isEmpty else { return ([], [], [], [], nil) }
 
         let paddedChunk = manager.padAudioIfNeeded(samples, targetLength: maxModelSamples)
 
@@ -699,7 +702,7 @@ struct ChunkProcessor {
         )
 
         if hypothesis.isEmpty || encoderSequenceLength == 0 {
-            return ([], [], [], [], hypothesis.phraseBoostingFailed)
+            return ([], [], [], [], hypothesis.phraseBoostingFailureReason)
         }
 
         return (
@@ -707,7 +710,7 @@ struct ChunkProcessor {
             hypothesis.timestamps,
             hypothesis.tokenConfidences,
             hypothesis.tokenDurations,
-            hypothesis.phraseBoostingFailed
+            hypothesis.phraseBoostingFailureReason
         )
     }
 

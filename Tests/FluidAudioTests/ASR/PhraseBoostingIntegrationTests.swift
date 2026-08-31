@@ -60,6 +60,13 @@ final class PhraseBoostingIntegrationTests: XCTestCase {
         if let expected = environment["FLUID_AUDIO_TURBOBIAS_EXPECTED"] {
             XCTAssertEqual(boosted.result.text, expected)
         }
+
+        await manager.unloadPhraseBoostingJoint()
+        let supportsAfterUnload = await manager.supportsPhraseBoosting
+        XCTAssertFalse(supportsAfterUnload)
+        try await manager.loadPhraseBoostingJoint(from: URL(fileURLWithPath: phraseJointPath))
+        let supportsAfterReload = await manager.supportsPhraseBoosting
+        XCTAssertTrue(supportsAfterReload)
     }
 
     private func transcribe(

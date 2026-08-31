@@ -208,7 +208,7 @@ internal struct TdtDecoderV3: Sendable {
                 // already-valid primary path if memory pressure prevents setup.
                 phraseWorkspace = nil
                 phraseBoostingIsHealthy = false
-                hypothesis.phraseBoostingFailed = true
+                hypothesis.phraseBoostingFailureReason = .workspaceUnavailable
                 logger.error(
                     "Phrase boosting setup failed; continuing with primary ASR: \(error.localizedDescription)")
             }
@@ -216,7 +216,7 @@ internal struct TdtDecoderV3: Sendable {
             phraseWorkspace = nil
             if phraseBoostingContext != nil {
                 phraseBoostingIsHealthy = false
-                hypothesis.phraseBoostingFailed = true
+                hypothesis.phraseBoostingFailureReason = .jointUnavailable
             }
         }
         var phraseState = decoderState.phraseBoostingState ?? phraseBoostingContext?.rootState ?? 0
@@ -258,7 +258,7 @@ internal struct TdtDecoderV3: Sendable {
                 // valid primary token, so preserve it and disable the failed helper
                 // for the rest of this decode instead of discarding the transcript.
                 phraseBoostingIsHealthy = false
-                hypothesis.phraseBoostingFailed = true
+                hypothesis.phraseBoostingFailureReason = .predictionFailed
                 logger.error(
                     "Phrase boosting failed; continuing with primary ASR: \(error.localizedDescription)")
                 return nil

@@ -252,7 +252,8 @@ public final class TextNormalizer: Sendable {
             ctcDetectedTerms: result.ctcDetectedTerms,
             ctcAppliedTerms: result.ctcAppliedTerms,
             phraseBoostedTerms: result.phraseBoostedTerms,
-            phraseBoostingFailed: result.phraseBoostingFailed
+            phraseBoostingFailed: result.phraseBoostingFailed,
+            phraseBoostingFailureReason: result.phraseBoostingFailureReason
         )
     }
 

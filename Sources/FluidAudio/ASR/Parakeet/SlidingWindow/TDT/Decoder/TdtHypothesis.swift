@@ -7,7 +7,8 @@ struct TdtHypothesis {
     var timestamps: [Int] = []
     var tokenDurations: [Int] = []
     var tokenConfidences: [Float] = []
-    var phraseBoostingFailed = false
+    var phraseBoostingFailureReason: PhraseBoostingFailureReason?
+    var phraseBoostingFailed: Bool { phraseBoostingFailureReason != nil }
     /// Last non-blank token decoded in this hypothesis.
     /// Used to initialize the decoder for the next chunk, maintaining context across chunk boundaries.
     var lastToken: Int?

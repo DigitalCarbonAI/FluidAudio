@@ -152,6 +152,24 @@ public actor AsrManager {
         )
     }
 
+    /// Drop the optional full-vocabulary joint after a decode-time failure so a later
+    /// session must load a fresh Core ML instance rather than reuse a suspect one.
+    public func unloadPhraseBoostingJoint() {
+        phraseBoostingJointModel = nil
+        guard let models = asrModels, models.phraseBoostingJoint != nil else { return }
+        asrModels = AsrModels(
+            encoder: models.encoder,
+            preprocessor: models.preprocessor,
+            decoder: models.decoder,
+            joint: models.joint,
+            phraseBoostingJoint: nil,
+            ctcHead: models.ctcHead,
+            configuration: models.configuration,
+            vocabulary: models.vocabulary,
+            version: models.version
+        )
+    }
+
     /// Prepare an immutable phrase graph once for reuse across transcriptions.
     public func makePhraseBoostingContext(
         phrases: [String],
