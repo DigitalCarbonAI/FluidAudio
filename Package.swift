@@ -28,6 +28,7 @@ let package = Package(
                 "NemoTextProcessing",
             ],
             path: "Sources/FluidAudio",
+            exclude: ["ASR/Parakeet/Unified/benchmark.md"],
             resources: [
                 .copy("TTS/LuxTts/G2p/Resources")
             ]
@@ -65,6 +66,7 @@ let package = Package(
                 "FluidAudio",
                 "FluidAudioCLI",
             ],
+            exclude: ["ASR/Parakeet/SlidingWindow/CTC/sample_medical.arpa"],
             resources: [
                 .copy("TTS/LuxTts/Resources")
             ]
