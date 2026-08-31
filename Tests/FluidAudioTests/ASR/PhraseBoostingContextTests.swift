@@ -263,6 +263,64 @@ final class PhraseBoostingContextTests: XCTestCase {
         )
     }
 
+    func testCaseInsensitivePhraseUsesLowercaseTokensWhenOriginalCasingIsUnavailable() throws {
+        var accentedVocabulary = vocabulary
+        accentedVocabulary[896] = "ó"
+        let context = try PhraseBoostingContext(
+            phrases: ["Óla"],
+            vocabulary: accentedVocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig()
+        )
+
+        XCTAssertEqual(context.phrases, ["Óla"])
+        XCTAssertEqual(context.tokenizedPhrases, [[819, 896, 829, 823]])
+        XCTAssertEqual(context.skippedPhraseCount, 0)
+        XCTAssertEqual(context.matchingPhrases(in: context.tokenizedPhrases[0]), ["Óla"])
+    }
+
+    func testVariativeBPENewEndpointUsesSharedSourcePotential() throws {
+        // This compact graph forces a merged-token alternative to reuse a higher-scored
+        // source state. NeMo repairs the following newly created endpoint from that actual
+        // source potential rather than the phrase-local accumulated score.
+        let sharedStateVocabulary: [Int: String] = [
+            0: "<unk>",
+            1: "ba",
+            2: "▁b",
+            3: "ab",
+            4: "▁",
+            5: "a",
+            6: "b",
+            7: "c",
+        ]
+        let context = try PhraseBoostingContext(
+            phrases: ["cabb", "baaa", "bbb"],
+            vocabulary: sharedStateVocabulary,
+            blankID: 16,
+            config: PhraseBoostingConfig(variativeScoringTemperature: 0)
+        )
+
+        var prefixScores = Array(repeating: Float(-100), count: 17)
+        prefixScores[2] = 0
+        let prefix = context.select(
+            baseToken: 2,
+            acousticScores: prefixScores,
+            state: context.rootState
+        )
+        XCTAssertEqual(prefix.token, 2)
+
+        var continuationScores = Array(repeating: Float(-100), count: 17)
+        continuationScores[5] = 0
+        continuationScores[6] = -0.1
+        let continuation = context.select(
+            baseToken: 5,
+            acousticScores: continuationScores,
+            state: prefix.nextState
+        )
+
+        XCTAssertEqual(continuation.token, 6)
+    }
+
     func testAlternativeLowercasePathRestoresDeliberateDictionaryCasing() throws {
         let context = try PhraseBoostingContext(
             phrases: ["Codex"],

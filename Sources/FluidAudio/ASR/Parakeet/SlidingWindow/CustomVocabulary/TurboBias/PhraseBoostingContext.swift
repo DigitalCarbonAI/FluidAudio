@@ -203,29 +203,25 @@ public struct PhraseBoostingContext: Sendable {
         var skippedPhrases = 0
         var firstUnsupportedPhrase: String?
         for phrase in normalizedPhrases {
-            guard let tokens = tokenizer.encode(phrase), !tokens.isEmpty else {
+            let tokens: [Int]?
+            let representation: VariativeRepresentation?
+            if config.caseInsensitive {
+                let lowercasePhrase = phrase.lowercased()
+                tokens = tokenizer.encode(phrase) ?? tokenizer.encode(lowercasePhrase)
+                representation = tokenizer.variativeRepresentation(for: lowercasePhrase)
+            } else {
+                tokens = tokenizer.encode(phrase)
+                representation = nil
+            }
+            guard let tokens, !tokens.isEmpty,
+                !config.caseInsensitive || representation != nil
+            else {
                 guard skipUnsupportedPhrases else {
                     throw PhraseBoostingError.untokenizablePhrase(phrase)
                 }
                 skippedPhrases += 1
                 firstUnsupportedPhrase = firstUnsupportedPhrase ?? phrase
                 continue
-            }
-
-            let representation: VariativeRepresentation?
-            if config.caseInsensitive {
-                guard let prepared = tokenizer.variativeRepresentation(for: phrase.lowercased())
-                else {
-                    guard skipUnsupportedPhrases else {
-                        throw PhraseBoostingError.untokenizablePhrase(phrase)
-                    }
-                    skippedPhrases += 1
-                    firstUnsupportedPhrase = firstUnsupportedPhrase ?? phrase
-                    continue
-                }
-                representation = prepared
-            } else {
-                representation = nil
             }
             acceptedPhrases.append(phrase)
             tokenizedPhrases.append(tokens)
@@ -367,12 +363,6 @@ public struct PhraseBoostingContext: Sendable {
             if let existing = nodes[state].children[primaryToken] {
                 nextState = existing
                 nodes[state].primaryChildren[primaryToken] = existing
-                if isPrimaryEndpoint[index] {
-                    let sourceIndex = statesByCanonicalPosition.count - primaryBackJumps[index]
-                    let primaryPotential =
-                        nodes[statesByCanonicalPosition[sourceIndex]].nodeScore + primaryScores[index]
-                    nodes[existing].nodeScore = max(nodes[existing].nodeScore, primaryPotential)
-                }
             } else {
                 let potential: Float
                 if config.penalizeSubsplits, !isPrimaryEndpoint[index] {
@@ -384,6 +374,13 @@ public struct PhraseBoostingContext: Sendable {
                 nodes.append(Node(nodeScore: potential))
                 nodes[state].children[primaryToken] = nextState
                 nodes[state].primaryChildren[primaryToken] = nextState
+            }
+
+            if isPrimaryEndpoint[index] {
+                let sourceIndex = statesByCanonicalPosition.count - primaryBackJumps[index]
+                let primaryPotential =
+                    nodes[statesByCanonicalPosition[sourceIndex]].nodeScore + primaryScores[index]
+                nodes[nextState].nodeScore = max(nodes[nextState].nodeScore, primaryPotential)
             }
 
             for alternative in group.dropFirst() {
