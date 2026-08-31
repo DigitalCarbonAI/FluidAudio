@@ -115,6 +115,10 @@ Make a PR if you want to add your app, please keep it in chronological order.
 | **[Hedy](https://hedy.ai)** | Privacy-first AI meeting coach for iOS, macOS, Android, and Windows. Real-time, fully on-device transcription with speaker diarization and AI-powered conversation insights. Uses Parakeet and Nemotron streaming ASR and speaker diarization on the Apple Neural Engine. |
 | **[Parakey](https://github.com/rcourtman/parakey)** | Open-source (MIT) menu-bar push-to-talk dictation for macOS — hold a key, speak, release; the transcript pastes at the cursor in about 100 ms. Uses Parakeet TDT v3 ASR on the Apple Neural Engine via FluidAudio. |
 | **[TypeWhisper](https://www.typewhisper.com/)** | Speech-to-text and AI text processing for macOS. Uses FluidAudio's Parakeet ASR for local transcription. |
+| **[evoglyph](https://evoglyph.com)** | Lightweight, privacy-first macOS menu-bar dictation — press a hotkey, speak, and cleaned-up text is injected at your cursor. Fully local: Parakeet TDT ASR with CTC vocabulary boosting and Silero VAD via FluidAudio on the Apple Neural Engine, plus on-device LLM cleanup. Audio never leaves the Mac. |
+| **[echo99](https://www.echo99.app)** | Private call recorder for macOS. Menu-bar app that records the mic and system audio as separate tracks and transcribes them entirely on-device. |
+| **[Presspeech](https://github.com/rcourtman/presspeech)** | Open-source (MIT) menu-bar push-to-talk dictation for macOS — hold a key, speak, release; the transcript pastes at the cursor in about 100 ms. Uses Parakeet TDT v3 ASR on the Apple Neural Engine via FluidAudio. |
+| **[Better Voice](https://voice.baselinemakes.com)** | macOS menu-bar app for on-device dictation and meeting notes that save to Apple Notes. Everything runs locally. Uses speaker diarization. |
 
 ## Installation
 
@@ -233,22 +237,22 @@ swift run fluidaudiocli transcribe audio.wav
 <details>
 <summary><b>Offline-only mode</b> - Refuse every network fetch, bundle your own models</summary>
 
-If your application ships pre-downloaded model assets and never wants FluidAudio to reach HuggingFace at runtime (privacy-sensitive desktop apps, air-gapped deployments, kiosk builds), set the static `DownloadUtils.enforceOffline` flag at startup:
+If your application ships pre-downloaded model assets and never wants FluidAudio to reach HuggingFace at runtime (privacy-sensitive desktop apps, air-gapped deployments, kiosk builds), set the static `ModelHub.offlineMode` flag at startup:
 
 ```swift
 import FluidAudio
 
 // Set once before any FluidAudio loader runs.
-DownloadUtils.enforceOffline = true
+ModelHub.offlineMode = true
 
 // Load via manual APIs that read from your bundled directory:
 let asr = try await AsrModels.load(from: bundledModelURL, configuration: config)
 ```
 
 When the flag is on:
-- `fetchWithAuth`, `downloadRepo`, `downloadSubdirectory`, and `fetchHuggingFaceFile` throw `DownloadUtils.OfflineError.networkDisabled(operation:)` instead of touching the network.
+- `fetchWithAuth`, `download`, and `fetchFile` throw `DownloadError.networkDisabled(operation:)` instead of touching the network.
 - `loadModels` short-circuits its retry-with-redownload fallback so a corrupt-detected `.mlmodelc` surfaces the original load error instead of silently re-fetching.
-- If `loadModels` is invoked but required files are missing from the local directory, `DownloadUtils.OfflineError.modelMissing(repo:missing:)` is thrown with the missing file list so the caller can ship a fix.
+- If `loadModels` is invoked but required files are missing from the local directory, `DownloadError.modelMissing(repo:missing:)` is thrown with the missing file list so the caller can ship a fix.
 
 The default is `false` — no behaviour change for existing callers. Combine with a custom `ModelRegistry.baseURL` only if you want offline-mode + a typed offline error rather than relying on a mirror URL.
 

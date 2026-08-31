@@ -787,17 +787,18 @@ extension NemotronMultilingualFleursBenchmark {
 
             // Print summary table
             print("")
-            let summaryHeader = [
-                "Language".padding(toLength: 12, withPad: " ", startingAt: 0),
-                "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0),
-                "WER%".padding(toLength: 6, withPad: " ", startingAt: 0),
-                "CER%".padding(toLength: 6, withPad: " ", startingAt: 0),
-                "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0),
-                "Duration".padding(toLength: 9, withPad: " ", startingAt: 0),
-                "Processed".padding(toLength: 9, withPad: " ", startingAt: 0),
-                "Skipped",
-            ].joined(separator: " | ")
-            print(summaryHeader)
+            print(
+                [
+                    "Language".padding(toLength: 12, withPad: " ", startingAt: 0),
+                    "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0),
+                    "WER%".padding(toLength: 6, withPad: " ", startingAt: 0),
+                    "CER%".padding(toLength: 6, withPad: " ", startingAt: 0),
+                    "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0),
+                    "Duration".padding(toLength: 9, withPad: " ", startingAt: 0),
+                    "Processed".padding(toLength: 9, withPad: " ", startingAt: 0),
+                    "Skipped",
+                ].joined(separator: " | ")
+            )
             print(String(repeating: "-", count: 80))
 
             for r in results {
@@ -808,14 +809,16 @@ extension NemotronMultilingualFleursBenchmark {
                 let procStr = String(r.samplesProcessed)
                 let skipStr = r.samplesSkipped > 0 ? String(r.samplesSkipped) : "-"
                 print(
-                    r.language.padding(toLength: 12, withPad: " ", startingAt: 0) + " | "
-                        + r.promptLanguageCode.padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
-                        + werStr.padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + cerStr.padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + rtfxStr.padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + durStr.padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                        + procStr.padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                        + skipStr
+                    [
+                        r.language.padding(toLength: 12, withPad: " ", startingAt: 0),
+                        r.promptLanguageCode.padding(toLength: 8, withPad: " ", startingAt: 0),
+                        werStr.padding(toLength: 6, withPad: " ", startingAt: 0),
+                        cerStr.padding(toLength: 6, withPad: " ", startingAt: 0),
+                        rtfxStr.padding(toLength: 6, withPad: " ", startingAt: 0),
+                        durStr.padding(toLength: 9, withPad: " ", startingAt: 0),
+                        procStr.padding(toLength: 9, withPad: " ", startingAt: 0),
+                        skipStr,
+                    ].joined(separator: " | ")
                 )
             }
 
@@ -825,11 +828,13 @@ extension NemotronMultilingualFleursBenchmark {
                 let avgRTFx = results.reduce(0.0) { $0 + $1.rtfx } / Double(results.count)
                 print(String(repeating: "-", count: 80))
                 print(
-                    "AVERAGE".padding(toLength: 12, withPad: " ", startingAt: 0) + " | "
-                        + "—".padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
-                        + String(format: "%.1f", avgWER * 100).padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + String(format: "%.1f", avgCER * 100).padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + String(format: "%.1f", avgRTFx).padding(toLength: 6, withPad: " ", startingAt: 0)
+                    [
+                        "AVERAGE".padding(toLength: 12, withPad: " ", startingAt: 0),
+                        "—".padding(toLength: 8, withPad: " ", startingAt: 0),
+                        String(format: "%.1f", avgWER * 100).padding(toLength: 6, withPad: " ", startingAt: 0),
+                        String(format: "%.1f", avgCER * 100).padding(toLength: 6, withPad: " ", startingAt: 0),
+                        String(format: "%.1f", avgRTFx).padding(toLength: 6, withPad: " ", startingAt: 0),
+                    ].joined(separator: " | ")
                 )
             }
         } catch {

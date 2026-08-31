@@ -34,7 +34,7 @@ extension AsrManager {
                 confidences: hypothesis.tokenConfidences,
                 tokenDurations: hypothesis.tokenDurations,
                 encoderSequenceLength: encoderSequenceLength,
-                audioSamples: audioSamples,
+                audioSampleCount: audioSamples.count,
                 processingTime: Date().timeIntervalSince(startTime),
                 phraseBoosting: phraseBoosting,
                 phraseBoostingFailureReason: hypothesis.phraseBoostingFailureReason
@@ -105,7 +105,7 @@ extension AsrManager {
         confidences: [Float] = [],
         tokenDurations: [Int] = [],
         encoderSequenceLength: Int,
-        audioSamples: [Float],
+        audioSampleCount: Int,
         processingTime: TimeInterval,
         phraseBoosting: PhraseBoostingContext? = nil,
         phraseBoostingFailureReason: PhraseBoostingFailureReason? = nil
@@ -115,7 +115,7 @@ extension AsrManager {
         let text =
             effectivePhraseBoosting?.formattedText(in: tokenIds, vocabulary: vocabulary)
             ?? convertTokensToText(tokenIds)
-        let duration = TimeInterval(audioSamples.count) / TimeInterval(config.sampleRate)
+        let duration = TimeInterval(audioSampleCount) / TimeInterval(config.sampleRate)
 
         let resultTimings = createTokenTimings(
             from: tokenIds, timestamps: timestamps, confidences: confidences, tokenDurations: tokenDurations)
