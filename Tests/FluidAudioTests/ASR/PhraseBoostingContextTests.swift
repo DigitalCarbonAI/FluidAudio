@@ -401,6 +401,20 @@ final class PhraseBoostingContextTests: XCTestCase {
         }
     }
 
+    func testUnsupportedPhraseCanBeSkippedWithoutDiscardingSupportedPhrases() throws {
+        let context = try PhraseBoostingContext(
+            phrases: ["Nguyễn", "codex"],
+            vocabulary: vocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig(),
+            skipUnsupportedPhrases: true
+        )
+
+        XCTAssertEqual(context.phrases, ["codex"])
+        XCTAssertEqual(context.skippedPhraseCount, 1)
+        XCTAssertEqual(context.matchingPhrases(in: context.tokenizedPhrases[0]), ["codex"])
+    }
+
     func testRejectsNegativeUnknownScore() {
         XCTAssertThrowsError(
             try PhraseBoostingContext(

@@ -57,8 +57,8 @@ public enum PhraseBoostingError: Error, LocalizedError, Equatable {
             return "Phrase boosting scores must be finite, nonnegative, and use depth scaling of at least 1."
         case .emptyPhrase:
             return "Dictionary phrases must contain text."
-        case .untokenizablePhrase(let phrase):
-            return "The Parakeet tokenizer could not represent ‘\(phrase)’ without an unknown token."
+        case .untokenizablePhrase:
+            return "The Parakeet tokenizer could not represent one dictionary phrase without an unknown token."
         }
     }
 }
@@ -109,6 +109,7 @@ public struct PhraseBoostingContext: Sendable {
     public let phrases: [String]
     public let tokenizedPhrases: [[Int]]
     public let config: PhraseBoostingConfig
+    public let skippedPhraseCount: Int
 
     let blankID: Int
     private let nodes: [Node]
@@ -170,7 +171,8 @@ public struct PhraseBoostingContext: Sendable {
         phrases: [String],
         vocabulary: [Int: String],
         blankID: Int,
-        config: PhraseBoostingConfig
+        config: PhraseBoostingConfig,
+        skipUnsupportedPhrases: Bool = false
     ) throws {
         guard config.contextScore.isFinite, config.contextScore >= 0,
             config.depthScaling.isFinite, config.depthScaling >= 1,
@@ -185,7 +187,9 @@ public struct PhraseBoostingContext: Sendable {
         let normalizedPhrases = phrases.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard normalizedPhrases.allSatisfy({ !$0.isEmpty }) else {
+        guard !normalizedPhrases.isEmpty,
+            normalizedPhrases.allSatisfy({ !$0.isEmpty })
+        else {
             throw PhraseBoostingError.emptyPhrase
         }
 
@@ -193,20 +197,50 @@ public struct PhraseBoostingContext: Sendable {
             vocabulary: vocabulary,
             blankID: blankID
         )
-        let tokenized = try normalizedPhrases.map { phrase in
+        var acceptedPhrases: [String] = []
+        var tokenizedPhrases: [[Int]] = []
+        var variativeRepresentations: [VariativeRepresentation?] = []
+        var skippedPhrases = 0
+        var firstUnsupportedPhrase: String?
+        for phrase in normalizedPhrases {
             guard let tokens = tokenizer.encode(phrase), !tokens.isEmpty else {
-                throw PhraseBoostingError.untokenizablePhrase(phrase)
+                guard skipUnsupportedPhrases else {
+                    throw PhraseBoostingError.untokenizablePhrase(phrase)
+                }
+                skippedPhrases += 1
+                firstUnsupportedPhrase = firstUnsupportedPhrase ?? phrase
+                continue
             }
-            return tokens
+
+            let representation: VariativeRepresentation?
+            if config.caseInsensitive {
+                guard let prepared = tokenizer.variativeRepresentation(for: phrase.lowercased())
+                else {
+                    guard skipUnsupportedPhrases else {
+                        throw PhraseBoostingError.untokenizablePhrase(phrase)
+                    }
+                    skippedPhrases += 1
+                    firstUnsupportedPhrase = firstUnsupportedPhrase ?? phrase
+                    continue
+                }
+                representation = prepared
+            } else {
+                representation = nil
+            }
+            acceptedPhrases.append(phrase)
+            tokenizedPhrases.append(tokens)
+            variativeRepresentations.append(representation)
+        }
+        guard !acceptedPhrases.isEmpty else {
+            throw PhraseBoostingError.untokenizablePhrase(firstUnsupportedPhrase ?? "")
         }
 
         var buildingNodes = [Node()]
-        for (phraseIndex, phrase) in normalizedPhrases.enumerated() {
+        for (phraseIndex, phrase) in acceptedPhrases.enumerated() {
             let terminalState: Int
             if config.caseInsensitive {
-                guard let representation = tokenizer.variativeRepresentation(for: phrase.lowercased())
-                else {
-                    throw PhraseBoostingError.untokenizablePhrase(phrase)
+                guard let representation = variativeRepresentations[phraseIndex] else {
+                    preconditionFailure("Case-insensitive phrase lost its variative representation")
                 }
                 terminalState = Self.addVariativePhrase(
                     representation,
@@ -215,7 +249,7 @@ public struct PhraseBoostingContext: Sendable {
                 )
             } else {
                 terminalState = Self.addGreedyPhrase(
-                    tokenized[phraseIndex],
+                    tokenizedPhrases[phraseIndex],
                     config: config,
                     to: &buildingNodes
                 )
@@ -239,9 +273,10 @@ public struct PhraseBoostingContext: Sendable {
 
         Self.fillFailureLinks(in: &buildingNodes)
 
-        self.phrases = normalizedPhrases
-        self.tokenizedPhrases = tokenized
+        self.phrases = acceptedPhrases
+        self.tokenizedPhrases = tokenizedPhrases
         self.config = config
+        self.skippedPhraseCount = skippedPhrases
         self.blankID = blankID
         self.nodes = buildingNodes
         self.maximumRootTransitionScore = max(

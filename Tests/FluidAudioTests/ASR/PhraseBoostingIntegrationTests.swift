@@ -26,6 +26,9 @@ final class PhraseBoostingIntegrationTests: XCTestCase {
                 tdtConfig: TdtConfig(blankId: AsrModelVersion.v2.blankId),
                 encoderHiddenSize: AsrModelVersion.v2.encoderHiddenSize),
             models: models)
+        let phraseJointPath = environment["FLUID_AUDIO_TURBOBIAS_JOINT_DIR"] ?? modelPath
+        try await manager.loadPhraseBoostingJoint(
+            from: URL(fileURLWithPath: phraseJointPath))
         let supportsPhraseBoosting = await manager.supportsPhraseBoosting
         XCTAssertTrue(supportsPhraseBoosting)
 

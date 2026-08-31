@@ -144,11 +144,6 @@ extension AsrModels {
         let decoder = try loadModel(fileNames.decoder, computeUnits: config.computeUnits)
         let joint = try loadModel(fileNames.joint, computeUnits: config.computeUnits)
 
-        let optionalPhraseJointPath = directory.appendingPathComponent(Names.phraseBoostingJointFile)
-        let phraseJoint =
-            version == .v2 && FileManager.default.fileExists(atPath: optionalPhraseJointPath.path)
-            ? try? loadModel(Names.phraseBoostingJointFile, computeUnits: config.computeUnits)
-            : nil
         let optionalCTCPath = directory.appendingPathComponent(Names.ctcHeadFile)
         let ctcHead =
             version == .tdtCtc110m && FileManager.default.fileExists(atPath: optionalCTCPath.path)
@@ -160,12 +155,29 @@ extension AsrModels {
             preprocessor: preprocessor,
             decoder: decoder,
             joint: joint,
-            phraseBoostingJoint: phraseJoint,
             ctcHead: ctcHead,
             configuration: config,
             vocabulary: try loadVocabularyFile(
                 at: directory.appendingPathComponent(fileNames.vocabulary)),
             version: version
+        )
+    }
+
+    /// Load the optional full-vocabulary joint from a host-managed resource directory.
+    ///
+    /// This is intentionally separate from `loadDirect`: applications that do not request
+    /// phrase boosting should not pay the model's load, specialization, or residency cost.
+    public static func loadPhraseBoostingJointDirect(
+        from directory: URL,
+        configuration: MLModelConfiguration? = nil
+    ) throws -> MLModel {
+        let path = directory.appendingPathComponent(Names.phraseBoostingJointFile)
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            throw AsrModelsError.modelNotFound(Names.phraseBoostingJointFile, path)
+        }
+        return try MLModel(
+            contentsOf: path,
+            configuration: configuration ?? defaultConfiguration()
         )
     }
 

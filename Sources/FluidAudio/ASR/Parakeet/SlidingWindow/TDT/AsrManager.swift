@@ -126,10 +126,37 @@ public actor AsrManager {
         asrModels?.version == .v2 && phraseBoostingJointModel != nil
     }
 
+    /// Load the optional v2 phrase-boosting joint only when a caller requests that feature.
+    /// Worker clones receive the updated model bundle, so long-audio chunking keeps the same
+    /// capability without sharing mutable decoder workspaces.
+    public func loadPhraseBoostingJoint(from directory: URL) throws {
+        guard asrModels?.version == .v2 else { throw PhraseBoostingError.unsupportedModel }
+        guard phraseBoostingJointModel == nil else { return }
+        guard let models = asrModels else { throw ASRError.notInitialized }
+
+        let phraseJoint = try AsrModels.loadPhraseBoostingJointDirect(
+            from: directory,
+            configuration: models.configuration
+        )
+        phraseBoostingJointModel = phraseJoint
+        asrModels = AsrModels(
+            encoder: models.encoder,
+            preprocessor: models.preprocessor,
+            decoder: models.decoder,
+            joint: models.joint,
+            phraseBoostingJoint: phraseJoint,
+            ctcHead: models.ctcHead,
+            configuration: models.configuration,
+            vocabulary: models.vocabulary,
+            version: models.version
+        )
+    }
+
     /// Prepare an immutable phrase graph once for reuse across transcriptions.
     public func makePhraseBoostingContext(
         phrases: [String],
-        config: PhraseBoostingConfig = PhraseBoostingConfig()
+        config: PhraseBoostingConfig = PhraseBoostingConfig(),
+        skipUnsupportedPhrases: Bool = false
     ) throws -> PhraseBoostingContext {
         guard asrModels?.version == .v2 else { throw PhraseBoostingError.unsupportedModel }
         guard phraseBoostingJointModel != nil else {
@@ -139,7 +166,8 @@ public actor AsrManager {
             phrases: phrases,
             vocabulary: vocabulary,
             blankID: asrModels?.version.blankId ?? 1_024,
-            config: config
+            config: config,
+            skipUnsupportedPhrases: skipUnsupportedPhrases
         )
     }
 
