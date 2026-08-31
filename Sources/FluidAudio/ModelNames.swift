@@ -324,6 +324,7 @@ public enum ModelNames {
         public static let encoder = "Encoder"
         public static let decoder = "Decoder"
         public static let joint = "JointDecision"
+        public static let phraseBoostingJoint = "RNNTJoint"
         public static let ctcHead = "CtcHead"
 
         // Shared vocabulary file across all model versions
@@ -333,6 +334,7 @@ public enum ModelNames {
         public static let encoderFile = encoder + ".mlmodelc"
         public static let decoderFile = decoder + ".mlmodelc"
         public static let jointFile = joint + ".mlmodelc"
+        public static let phraseBoostingJointFile = phraseBoostingJoint + ".mlmodelc"
         /// Joint decoder variant for v3 that exposes top-K outputs
         /// (`top_k_ids`, `top_k_logits`) used for language-aware script filtering.
         public static let jointV3File = "JointDecisionv3.mlmodelc"

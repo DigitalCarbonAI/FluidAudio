@@ -381,7 +381,7 @@ extension ChunkProcessor {
         var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
         decoderState.reset()
 
-        let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
+        let (windowTokens, windowTimestamps, windowConfidences, windowDurations, _) =
             try await Self.transcribeChunk(
                 samples: chunkSamplesArray,
                 contextSamples: contextSamples,

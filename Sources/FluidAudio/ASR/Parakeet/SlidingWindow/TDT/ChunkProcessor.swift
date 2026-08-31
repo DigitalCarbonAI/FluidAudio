@@ -10,6 +10,7 @@ struct ChunkProcessor {
         let index: Int
         let tokens: [TokenWindow]
         let workerIndex: Int
+        let phraseBoostingFailed: Bool
     }
     private struct IndexedToken {
         let index: Int
@@ -398,7 +399,8 @@ struct ChunkProcessor {
         using manager: AsrManager,
         startTime: Date,
         progressHandler: ((Double) async -> Void)? = nil,
-        language: Language? = nil
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> ASRResult {
         let requestedConcurrency = max(1, await manager.parallelChunkConcurrency)
         let workers = await makeWorkerPool(using: manager, count: requestedConcurrency) ?? [manager]
@@ -437,7 +439,7 @@ struct ChunkProcessor {
             preferSilenceAlignment: !melChunkContext && modelVersion == .v3
         )
 
-        var chunkOutputs: [[TokenWindow]?] = []
+        var chunkOutputs: [TaskResult?] = []
         var availableWorkers = Array(workers.indices)
         var inFlight = 0
         var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
@@ -449,7 +451,7 @@ struct ChunkProcessor {
         ) async throws {
             guard inFlight > 0 else { return }
             guard let finished = try await group.next() else { return }
-            chunkOutputs[finished.index] = finished.tokens
+            chunkOutputs[finished.index] = finished
             availableWorkers.append(finished.workerIndex)
             inFlight -= 1
         }
@@ -500,7 +502,10 @@ struct ChunkProcessor {
                     var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
                     decoderState.reset()
 
-                    let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
+                    let (
+                        windowTokens, windowTimestamps, windowConfidences, windowDurations,
+                        phraseBoostingFailed
+                    ) =
                         try await Self
                         .transcribeChunk(
                             samples: chunkSamplesArray,
@@ -511,6 +516,7 @@ struct ChunkProcessor {
                             decoderState: &decoderState,
                             maxModelSamples: maxModelSamples,
                             language: language,
+                            phraseBoosting: phraseBoosting,
                             emitTokensAfterFrame: emitTokensAfterFrame,
                             initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0
                         )
@@ -532,7 +538,12 @@ struct ChunkProcessor {
                         (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
                     }
 
-                    return TaskResult(index: index, tokens: windowData, workerIndex: workerIndex)
+                    return TaskResult(
+                        index: index,
+                        tokens: windowData,
+                        workerIndex: workerIndex,
+                        phraseBoostingFailed: phraseBoostingFailed
+                    )
                 }
                 inFlight += 1
                 chunkIndex += 1
@@ -565,7 +576,9 @@ struct ChunkProcessor {
             }
         }
 
-        let orderedChunkOutputs = chunkOutputs.compactMap { $0 }
+        let orderedResults = chunkOutputs.compactMap { $0 }
+        let orderedChunkOutputs = orderedResults.map(\.tokens)
+        let phraseBoostingFailed = orderedResults.contains { $0.phraseBoostingFailed }
 
         guard var mergedTokens = orderedChunkOutputs.first else {
             return await manager.processTranscriptionResult(
@@ -574,7 +587,8 @@ struct ChunkProcessor {
                 confidences: [],
                 encoderSequenceLength: 0,
                 audioSamples: [],
-                processingTime: Date().timeIntervalSince(startTime)
+                processingTime: Date().timeIntervalSince(startTime),
+                phraseBoosting: phraseBoosting
             )
         }
 
@@ -610,7 +624,9 @@ struct ChunkProcessor {
             tokenDurations: allDurations,
             encoderSequenceLength: 0,  // Not relevant for chunk processing
             audioSamples: [],
-            processingTime: Date().timeIntervalSince(startTime)
+            processingTime: Date().timeIntervalSince(startTime),
+            phraseBoosting: phraseBoosting,
+            phraseBoostingFailed: phraseBoostingFailed
         )
     }
 
@@ -647,10 +663,14 @@ struct ChunkProcessor {
         decoderState: inout TdtDecoderState,
         maxModelSamples: Int,
         language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil,
         emitTokensAfterFrame: Int? = nil,
         initialTimeIndexOverride: Int? = nil
-    ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int]) {
-        guard !samples.isEmpty else { return ([], [], [], []) }
+    ) async throws -> (
+        tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int],
+        phraseBoostingFailed: Bool
+    ) {
+        guard !samples.isEmpty else { return ([], [], [], [], false) }
 
         let paddedChunk = manager.padAudioIfNeeded(samples, targetLength: maxModelSamples)
 
@@ -673,15 +693,22 @@ struct ChunkProcessor {
             isLastChunk: isLastChunk,
             globalFrameOffset: globalFrameOffset,
             language: language,
+            phraseBoosting: phraseBoosting,
             emitTokensAfterGlobalFrame: emitTokensAfterFrame,
             initialTimeIndexOverride: initialTimeIndexOverride
         )
 
         if hypothesis.isEmpty || encoderSequenceLength == 0 {
-            return ([], [], [], [])
+            return ([], [], [], [], hypothesis.phraseBoostingFailed)
         }
 
-        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
+        return (
+            hypothesis.ySequence,
+            hypothesis.timestamps,
+            hypothesis.tokenConfidences,
+            hypothesis.tokenDurations,
+            hypothesis.phraseBoostingFailed
+        )
     }
 
     /// Token IDs whose vocabulary piece may safely start the portion spliced

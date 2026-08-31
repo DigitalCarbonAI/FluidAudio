@@ -106,6 +106,8 @@ internal struct TdtDecoderV3: Sendable {
         actualAudioFrames: Int,
         decoderModel: MLModel,
         jointModel: MLModel,
+        phraseBoostingJointModel: MLModel? = nil,
+        phraseBoostingContext: PhraseBoostingContext? = nil,
         decoderState: inout TdtDecoderState,
         contextFrameAdjustment: Int = 0,
         isLastChunk: Bool = false,
@@ -191,6 +193,77 @@ internal struct TdtDecoderV3: Sendable {
         let tokenIdBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .int32)
         let tokenProbBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .float32)
         let durationBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .int32)
+
+        let phraseWorkspace: PhraseBoostingJointWorkspace?
+        var phraseBoostingIsHealthy = true
+        if phraseBoostingContext != nil, phraseBoostingJointModel != nil {
+            do {
+                phraseWorkspace = try PhraseBoostingJointWorkspace(
+                    encoderHiddenSize: expectedEncoderHidden,
+                    decoderHiddenSize: decoderHidden,
+                    outputSize: config.tdtConfig.blankId + config.tdtConfig.durationBins.count + 1
+                )
+            } catch {
+                // Tensor allocation belongs to the optional helper. Preserve the
+                // already-valid primary path if memory pressure prevents setup.
+                phraseWorkspace = nil
+                phraseBoostingIsHealthy = false
+                hypothesis.phraseBoostingFailed = true
+                logger.error(
+                    "Phrase boosting setup failed; continuing with primary ASR: \(error.localizedDescription)")
+            }
+        } else {
+            phraseWorkspace = nil
+            if phraseBoostingContext != nil {
+                phraseBoostingIsHealthy = false
+                hypothesis.phraseBoostingFailed = true
+            }
+        }
+        var phraseState = decoderState.phraseBoostingState ?? phraseBoostingContext?.rootState ?? 0
+
+        func selectPhraseToken(
+            baseToken: Int,
+            baseProbability: Float,
+            state: Int,
+            timeIndex: Int
+        ) -> PhraseBoostingContext.Selection? {
+            guard phraseBoostingIsHealthy,
+                baseToken != config.tdtConfig.blankId,
+                let phraseBoostingContext
+            else { return nil }
+            if let selection = phraseBoostingContext.selectionWithoutAcousticScores(
+                baseToken: baseToken,
+                baseProbability: baseProbability,
+                state: state
+            ) {
+                return selection
+            }
+            guard let phraseBoostingJointModel,
+                let phraseWorkspace
+            else { return nil }
+            do {
+                let scores = try phraseWorkspace.scores(
+                    encoderFrames: encoderFrames,
+                    timeIndex: timeIndex,
+                    preparedDecoderStep: reusableDecoderStep,
+                    model: phraseBoostingJointModel
+                )
+                return phraseBoostingContext.select(
+                    baseToken: baseToken,
+                    acousticScores: scores,
+                    state: state
+                )
+            } catch {
+                // Phrase fusion is optional. The optimized joint already produced a
+                // valid primary token, so preserve it and disable the failed helper
+                // for the rest of this decode instead of discarding the transcript.
+                phraseBoostingIsHealthy = false
+                hypothesis.phraseBoostingFailed = true
+                logger.error(
+                    "Phrase boosting failed; continuing with primary ASR: \(error.localizedDescription)")
+                return nil
+            }
+        }
 
         // Initialize decoder LSTM state for a fresh utterance
         // This ensures clean state when starting transcription
@@ -298,6 +371,17 @@ internal struct TdtDecoderV3: Sendable {
                     topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
             }
 
+            var selectedPhraseState = phraseState
+            if let selection = selectPhraseToken(
+                baseToken: label,
+                baseProbability: score,
+                state: phraseState,
+                timeIndex: safeTimeIndices
+            ) {
+                label = selection.token
+                selectedPhraseState = selection.nextState
+            }
+
             // Map duration bin to actual frame count
             // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
             var duration = try TdtDurationMapping.mapDurationBin(
@@ -386,6 +470,17 @@ internal struct TdtDecoderV3: Sendable {
                         topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
                 }
 
+                selectedPhraseState = phraseState
+                if let selection = selectPhraseToken(
+                    baseToken: label,
+                    baseProbability: score,
+                    state: phraseState,
+                    timeIndex: safeTimeIndices
+                ) {
+                    label = selection.token
+                    selectedPhraseState = selection.nextState
+                }
+
                 duration = try TdtDurationMapping.mapDurationBin(
                     innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
 
@@ -426,6 +521,7 @@ internal struct TdtDecoderV3: Sendable {
                     hypothesis.tokenDurations.append(duration)
                 }
                 hypothesis.lastToken = label  // Remember for next iteration
+                phraseState = selectedPhraseState
 
                 // CRITICAL: Update decoder LSTM with the new token
                 // This updates the language model context for better predictions
@@ -527,8 +623,19 @@ internal struct TdtDecoderV3: Sendable {
                     needsTopK: needsTopK
                 )
 
-                let token = decision.token
+                var token = decision.token
                 let score = TdtDurationMapping.clampProbability(decision.probability)
+
+                var finalPhraseState = phraseState
+                if let selection = selectPhraseToken(
+                    baseToken: token,
+                    baseProbability: score,
+                    state: phraseState,
+                    timeIndex: frameIndex
+                ) {
+                    token = selection.token
+                    finalPhraseState = selection.nextState
+                }
 
                 // Also get duration for proper timestamp calculation
                 let duration = try TdtDurationMapping.mapDurationBin(
@@ -554,6 +661,7 @@ internal struct TdtDecoderV3: Sendable {
                         hypothesis.tokenDurations.append(duration)
                     }
                     hypothesis.lastToken = token
+                    phraseState = finalPhraseState
 
                     // Update decoder state
                     let step = try modelInference.runDecoder(
@@ -582,6 +690,7 @@ internal struct TdtDecoderV3: Sendable {
             decoderState = finalState
         }
         decoderState.lastToken = hypothesis.lastToken
+        decoderState.phraseBoostingState = phraseBoostingContext == nil ? nil : phraseState
 
         // Clear cached predictor output if ending with punctuation
         // This prevents punctuation from being duplicated at chunk boundaries

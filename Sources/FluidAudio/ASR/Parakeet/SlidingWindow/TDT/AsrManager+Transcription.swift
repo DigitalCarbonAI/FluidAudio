@@ -3,7 +3,10 @@ import Foundation
 extension AsrManager {
 
     internal func transcribeWithState(
-        _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
         let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
@@ -21,7 +24,8 @@ extension AsrManager {
                 actualAudioFrames: nil,  // Will be calculated from originalLength
                 decoderState: &decoderState,
                 isLastChunk: true,  // Single-chunk: always first and last
-                language: language
+                language: language,
+                phraseBoosting: phraseBoosting
             )
 
             let result = processTranscriptionResult(
@@ -31,7 +35,9 @@ extension AsrManager {
                 tokenDurations: hypothesis.tokenDurations,
                 encoderSequenceLength: encoderSequenceLength,
                 audioSamples: audioSamples,
-                processingTime: Date().timeIntervalSince(startTime)
+                processingTime: Date().timeIntervalSince(startTime),
+                phraseBoosting: phraseBoosting,
+                phraseBoostingFailed: hypothesis.phraseBoostingFailed
             )
 
             return result
@@ -46,7 +52,8 @@ extension AsrManager {
                 guard let self else { return }
                 await self.progressEmitter.report(progress: progress)
             },
-            language: language
+            language: language,
+            phraseBoosting: phraseBoosting
         )
 
         return result
@@ -59,7 +66,8 @@ extension AsrManager {
         decoderState: inout TdtDecoderState,
         previousTokens: [Int] = [],
         isLastChunk: Bool = false,
-        language: Language? = nil
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], encoderSequenceLength: Int) {
         let (alignedSamples, frameAlignedLength) = frameAlignedAudio(
             chunkSamples, allowAlignment: previousTokens.isEmpty)
@@ -71,7 +79,8 @@ extension AsrManager {
             decoderState: &decoderState,
             contextFrameAdjustment: 0,  // Non-streaming chunks don't use adaptive context
             isLastChunk: isLastChunk,
-            language: language
+            language: language,
+            phraseBoosting: phraseBoosting
         )
 
         // Apply token deduplication if previous tokens are provided
@@ -97,10 +106,15 @@ extension AsrManager {
         tokenDurations: [Int] = [],
         encoderSequenceLength: Int,
         audioSamples: [Float],
-        processingTime: TimeInterval
+        processingTime: TimeInterval,
+        phraseBoosting: PhraseBoostingContext? = nil,
+        phraseBoostingFailed: Bool = false
     ) -> ASRResult {
 
-        let text = convertTokensToText(tokenIds)
+        let effectivePhraseBoosting = phraseBoostingFailed ? nil : phraseBoosting
+        let text =
+            effectivePhraseBoosting?.formattedText(in: tokenIds, vocabulary: vocabulary)
+            ?? convertTokensToText(tokenIds)
         let duration = TimeInterval(audioSamples.count) / TimeInterval(config.sampleRate)
 
         let resultTimings = createTokenTimings(
@@ -117,7 +131,9 @@ extension AsrManager {
             confidence: confidence,
             duration: duration,
             processingTime: processingTime,
-            tokenTimings: resultTimings
+            tokenTimings: resultTimings,
+            phraseBoostedTerms: effectivePhraseBoosting?.matchingPhrases(in: tokenIds),
+            phraseBoostingFailed: phraseBoosting == nil ? nil : phraseBoostingFailed
         )
     }
 

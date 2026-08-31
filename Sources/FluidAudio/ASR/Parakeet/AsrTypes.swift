@@ -95,13 +95,20 @@ public struct ASRResult: Codable, Sendable {
     public let performanceMetrics: ASRPerformanceMetrics?
     public let ctcDetectedTerms: [String]?
     public let ctcAppliedTerms: [String]?
+    /// Dictionary phrases present in a decode that used TurboBias phrase fusion.
+    public let phraseBoostedTerms: [String]?
+    /// `true` when optional phrase fusion stopped but primary ASR continued.
+    /// Nil means phrase fusion was not requested, preserving older encoded results.
+    public let phraseBoostingFailed: Bool?
 
     public init(
         text: String, confidence: Float, duration: TimeInterval, processingTime: TimeInterval,
         tokenTimings: [TokenTiming]? = nil,
         performanceMetrics: ASRPerformanceMetrics? = nil,
         ctcDetectedTerms: [String]? = nil,
-        ctcAppliedTerms: [String]? = nil
+        ctcAppliedTerms: [String]? = nil,
+        phraseBoostedTerms: [String]? = nil,
+        phraseBoostingFailed: Bool? = nil
     ) {
         self.text = text
         self.confidence = confidence
@@ -111,6 +118,8 @@ public struct ASRResult: Codable, Sendable {
         self.performanceMetrics = performanceMetrics
         self.ctcDetectedTerms = ctcDetectedTerms
         self.ctcAppliedTerms = ctcAppliedTerms
+        self.phraseBoostedTerms = phraseBoostedTerms
+        self.phraseBoostingFailed = phraseBoostingFailed
     }
 
     /// Real-time factor (RTFx) - how many times faster than real-time
@@ -134,7 +143,9 @@ public struct ASRResult: Codable, Sendable {
             tokenTimings: tokenTimings,
             performanceMetrics: performanceMetrics,
             ctcDetectedTerms: detected,
-            ctcAppliedTerms: applied
+            ctcAppliedTerms: applied,
+            phraseBoostedTerms: phraseBoostedTerms,
+            phraseBoostingFailed: phraseBoostingFailed
         )
     }
 }

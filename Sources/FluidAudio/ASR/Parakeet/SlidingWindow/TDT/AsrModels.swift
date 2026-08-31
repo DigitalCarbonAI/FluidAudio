@@ -64,6 +64,9 @@ public struct AsrModels: Sendable {
     public let preprocessor: MLModel
     public let decoder: MLModel
     public let joint: MLModel
+    /// Optional full-vocabulary v2 joint head used for decode-time phrase boosting.
+    /// The normal JointDecision model remains the authoritative fast path.
+    public let phraseBoostingJoint: MLModel?
     /// Optional CTC decoder head for custom vocabulary (encoder features → CTC logits)
     public let ctcHead: MLModel?
     public let configuration: MLModelConfiguration
@@ -77,6 +80,7 @@ public struct AsrModels: Sendable {
         preprocessor: MLModel,
         decoder: MLModel,
         joint: MLModel,
+        phraseBoostingJoint: MLModel? = nil,
         ctcHead: MLModel? = nil,
         configuration: MLModelConfiguration,
         vocabulary: [Int: String],
@@ -86,6 +90,7 @@ public struct AsrModels: Sendable {
         self.preprocessor = preprocessor
         self.decoder = decoder
         self.joint = joint
+        self.phraseBoostingJoint = phraseBoostingJoint
         self.ctcHead = ctcHead
         self.configuration = configuration
         self.vocabulary = vocabulary
@@ -103,6 +108,65 @@ extension AsrModels {
     private struct ModelSpec {
         let fileName: String
         let computeUnits: MLComputeUnits
+    }
+
+    /// Load a host-managed, already verified model directory without network access,
+    /// cache deletion, or FluidAudio's Hugging Face repository layout.
+    public static func loadDirect(
+        from directory: URL,
+        configuration: MLModelConfiguration? = nil,
+        version: AsrModelVersion = .v3,
+        encoderPrecision: ParakeetEncoderPrecision = .int8,
+        encoderComputeUnits: MLComputeUnits? = nil
+    ) throws -> AsrModels {
+        let config = configuration ?? defaultConfiguration()
+        let fileNames = getModelFileNames(version: version, encoderPrecision: encoderPrecision)
+
+        func loadModel(_ name: String, computeUnits: MLComputeUnits) throws -> MLModel {
+            let path = directory.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: path.path) else {
+                throw AsrModelsError.modelNotFound(name, path)
+            }
+            let modelConfig = MLModelConfiguration()
+            modelConfig.computeUnits = computeUnits
+            return try MLModel(contentsOf: path, configuration: modelConfig)
+        }
+
+        let preprocessor = try loadModel(
+            Names.preprocessorFile,
+            computeUnits: version.hasFusedEncoder ? config.computeUnits : .cpuOnly)
+        let encoder =
+            version.hasFusedEncoder
+            ? nil
+            : try loadModel(
+                fileNames.encoder,
+                computeUnits: encoderComputeUnits ?? config.computeUnits)
+        let decoder = try loadModel(fileNames.decoder, computeUnits: config.computeUnits)
+        let joint = try loadModel(fileNames.joint, computeUnits: config.computeUnits)
+
+        let optionalPhraseJointPath = directory.appendingPathComponent(Names.phraseBoostingJointFile)
+        let phraseJoint =
+            version == .v2 && FileManager.default.fileExists(atPath: optionalPhraseJointPath.path)
+            ? try? loadModel(Names.phraseBoostingJointFile, computeUnits: config.computeUnits)
+            : nil
+        let optionalCTCPath = directory.appendingPathComponent(Names.ctcHeadFile)
+        let ctcHead =
+            version == .tdtCtc110m && FileManager.default.fileExists(atPath: optionalCTCPath.path)
+            ? try? loadModel(Names.ctcHeadFile, computeUnits: config.computeUnits)
+            : nil
+
+        return AsrModels(
+            encoder: encoder,
+            preprocessor: preprocessor,
+            decoder: decoder,
+            joint: joint,
+            phraseBoostingJoint: phraseJoint,
+            ctcHead: ctcHead,
+            configuration: config,
+            vocabulary: try loadVocabularyFile(
+                at: directory.appendingPathComponent(fileNames.vocabulary)),
+            version: version
+        )
     }
 
     private static func createModelSpecs(
@@ -309,6 +373,26 @@ extension AsrModels {
         }
         logger.info("Loaded \(fileNames.joint)")
 
+        // Parakeet v2 publishes this small full-vocabulary view of the same joint
+        // weights. It is optional so ordinary ASR still loads if an older install
+        // does not contain the sidecar; acquisition remains the host app's policy.
+        var phraseBoostingJointModel: MLModel?
+        if version == .v2 {
+            let jointPath = repoPath(from: directory, version: version)
+                .appendingPathComponent(Names.phraseBoostingJointFile)
+            if FileManager.default.fileExists(atPath: jointPath.path) {
+                let jointConfig = MLModelConfiguration()
+                jointConfig.computeUnits = config.computeUnits
+                do {
+                    phraseBoostingJointModel = try MLModel(contentsOf: jointPath, configuration: jointConfig)
+                    logger.info("Loaded optional \(Names.phraseBoostingJointFile)")
+                } catch {
+                    logger.warning(
+                        "Optional phrase-boosting joint failed to load: \(error.localizedDescription)")
+                }
+            }
+        }
+
         // [Beta] Optionally load CTC head model for custom vocabulary.
         // Supports two paths:
         //   v1: CtcHead.mlmodelc placed manually in the TDT model directory
@@ -354,6 +438,7 @@ extension AsrModels {
             preprocessor: preprocessorModel,
             decoder: decoderModel,
             joint: jointModel,
+            phraseBoostingJoint: phraseBoostingJointModel,
             ctcHead: ctcHeadModel,
             configuration: config,
             vocabulary: try loadVocabulary(from: directory, version: version),
@@ -366,6 +451,12 @@ extension AsrModels {
     private static func loadVocabulary(from directory: URL, version: AsrModelVersion) throws -> [Int: String] {
         let vocabularyFileName = getModelFileNames(version: version, encoderPrecision: .int8).vocabulary
         let vocabPath = repoPath(from: directory, version: version).appendingPathComponent(vocabularyFileName)
+
+        return try loadVocabularyFile(at: vocabPath)
+    }
+
+    private static func loadVocabularyFile(at vocabPath: URL) throws -> [Int: String] {
+        let vocabularyFileName = vocabPath.lastPathComponent
 
         if !FileManager.default.fileExists(atPath: vocabPath.path) {
             logger.warning(

@@ -13,6 +13,7 @@ public actor AsrManager {
     internal var encoderModel: MLModel?
     internal var decoderModel: MLModel?
     internal var jointModel: MLModel?
+    internal var phraseBoostingJointModel: MLModel?
 
     /// The AsrModels instance if initialized with models
     internal var asrModels: AsrModels?
@@ -69,6 +70,7 @@ public actor AsrManager {
             self.encoderModel = models.encoder
             self.decoderModel = models.decoder
             self.jointModel = models.joint
+            self.phraseBoostingJointModel = models.phraseBoostingJoint
             self.vocabulary = models.vocabulary
         }
 
@@ -119,6 +121,28 @@ public actor AsrManager {
         }
     }
 
+    /// Whether this loaded model can run NVIDIA-style decode-time phrase boosting.
+    public var supportsPhraseBoosting: Bool {
+        asrModels?.version == .v2 && phraseBoostingJointModel != nil
+    }
+
+    /// Prepare an immutable phrase graph once for reuse across transcriptions.
+    public func makePhraseBoostingContext(
+        phrases: [String],
+        config: PhraseBoostingConfig = PhraseBoostingConfig()
+    ) throws -> PhraseBoostingContext {
+        guard asrModels?.version == .v2 else { throw PhraseBoostingError.unsupportedModel }
+        guard phraseBoostingJointModel != nil else {
+            throw PhraseBoostingError.fullVocabularyJointUnavailable
+        }
+        return try PhraseBoostingContext(
+            phrases: phrases,
+            vocabulary: vocabulary,
+            blankID: asrModels?.version.blankId ?? 1_024,
+            config: config
+        )
+    }
+
     /// Load pre-loaded ASR models into this manager.
     /// - Parameter models: Pre-loaded ASR models
     public func loadModels(_ models: AsrModels) async throws {
@@ -129,6 +153,7 @@ public actor AsrManager {
         self.encoderModel = models.encoder
         self.decoderModel = models.decoder
         self.jointModel = models.joint
+        self.phraseBoostingJointModel = models.phraseBoostingJoint
         self.vocabulary = models.vocabulary
 
         logger.info("AsrManager loaded successfully with provided models")
@@ -208,6 +233,7 @@ public actor AsrManager {
         encoderModel = nil
         decoderModel = nil
         jointModel = nil
+        phraseBoostingJointModel = nil
         Task { await sharedMLArrayCache.clear() }
         logger.info("AsrManager resources cleaned up")
     }
@@ -222,6 +248,7 @@ public actor AsrManager {
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0,
         language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
         initialTimeIndexOverride: Int? = nil
     ) async throws -> TdtHypothesis {
@@ -287,6 +314,8 @@ public actor AsrManager {
                 actualAudioFrames: actualAudioFrames,
                 decoderModel: decoder_,
                 jointModel: joint,
+                phraseBoostingJointModel: models.phraseBoostingJoint,
+                phraseBoostingContext: phraseBoosting,
                 decoderState: &decoderState,
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
@@ -353,10 +382,15 @@ public actor AsrManager {
     public func transcribe(
         _ audioBuffer: AVAudioPCMBuffer,
         decoderState: inout TdtDecoderState,
-        language: Language? = nil
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> ASRResult {
         let audioFloatArray = try audioConverter.resampleBuffer(audioBuffer)
-        return try await transcribe(audioFloatArray, decoderState: &decoderState, language: language)
+        return try await transcribe(
+            audioFloatArray,
+            decoderState: &decoderState,
+            language: language,
+            phraseBoosting: phraseBoosting)
     }
 
     /// Transcribe audio from a file URL.
@@ -375,7 +409,10 @@ public actor AsrManager {
     /// - Returns: An ASRResult containing the transcribed text and token timings
     /// - Throws: ASRError if transcription fails, models are not initialized, or the file cannot be read
     public func transcribe(
-        _ url: URL, decoderState: inout TdtDecoderState, language: Language? = nil
+        _ url: URL,
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> ASRResult {
         // Check file size to decide streaming vs memory loading
         if config.streamingEnabled {
@@ -385,12 +422,20 @@ public actor AsrManager {
             let estimatedSamples = Int((Double(audioFile.length) * sampleRateRatio).rounded(.up))
 
             if estimatedSamples > config.streamingThreshold {
-                return try await transcribeDiskBacked(url, decoderState: &decoderState, language: language)
+                return try await transcribeDiskBacked(
+                    url,
+                    decoderState: &decoderState,
+                    language: language,
+                    phraseBoosting: phraseBoosting)
             }
         }
 
         let audioFloatArray = try audioConverter.resampleAudioFile(url)
-        let result = try await transcribe(audioFloatArray, decoderState: &decoderState, language: language)
+        let result = try await transcribe(
+            audioFloatArray,
+            decoderState: &decoderState,
+            language: language,
+            phraseBoosting: phraseBoosting)
         return result
     }
 
@@ -408,7 +453,10 @@ public actor AsrManager {
     /// - Returns: An ASRResult containing the transcribed text and token timings
     /// - Throws: ASRError if transcription fails, models are not initialized, or the file cannot be read
     public func transcribeDiskBacked(
-        _ url: URL, decoderState: inout TdtDecoderState, language: Language? = nil
+        _ url: URL,
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
 
@@ -442,7 +490,8 @@ public actor AsrManager {
                     guard let self else { return }
                     await self.progressEmitter.report(progress: progress)
                 },
-                language: language
+                language: language,
+                phraseBoosting: phraseBoosting
             )
 
             sampleSource.cleanup()
@@ -478,14 +527,19 @@ public actor AsrManager {
     public func transcribe(
         _ audioSamples: [Float],
         decoderState: inout TdtDecoderState,
-        language: Language? = nil
+        language: Language? = nil,
+        phraseBoosting: PhraseBoostingContext? = nil
     ) async throws -> ASRResult {
         let shouldEmitProgress = audioSamples.count > ASRConstants.maxModelSamples
         if shouldEmitProgress {
             _ = await progressEmitter.ensureSession()
         }
         do {
-            let result = try await transcribeWithState(audioSamples, decoderState: &decoderState, language: language)
+            let result = try await transcribeWithState(
+                audioSamples,
+                decoderState: &decoderState,
+                language: language,
+                phraseBoosting: phraseBoosting)
 
             if shouldEmitProgress {
                 await progressEmitter.finishSession()

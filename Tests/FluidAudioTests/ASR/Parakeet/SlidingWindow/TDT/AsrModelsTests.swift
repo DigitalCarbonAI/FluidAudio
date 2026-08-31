@@ -13,6 +13,7 @@ final class AsrModelsTests: XCTestCase {
         XCTAssertEqual(ModelNames.ASR.encoderFile, "Encoder.mlmodelc")
         XCTAssertEqual(ModelNames.ASR.decoderFile, "Decoder.mlmodelc")
         XCTAssertEqual(ModelNames.ASR.jointFile, "JointDecision.mlmodelc")
+        XCTAssertEqual(ModelNames.ASR.phraseBoostingJointFile, "RNNTJoint.mlmodelc")
         XCTAssertEqual(ModelNames.ASR.vocabulary(for: .parakeetV3), "parakeet_vocab.json")
         XCTAssertEqual(ModelNames.ASR.vocabulary(for: .parakeetV2), "parakeet_vocab.json")
     }
@@ -201,6 +202,23 @@ final class AsrModelsTests: XCTestCase {
         let vocabFile = "parakeet_vocab.json"
         XCTAssertTrue(vocabFile.hasSuffix(".json"))
         XCTAssertTrue(vocabFile.contains("vocab"))
+    }
+
+    func testLoadDirectRejectsMissingHostManagedModelWithoutDownloading() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AsrModelsTests-Direct-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertThrowsError(try AsrModels.loadDirect(from: directory, version: .v2)) { error in
+            guard let asrError = error as? AsrModelsError,
+                case .modelNotFound(let name, let path) = asrError
+            else {
+                return XCTFail("Expected modelNotFound, got \(error)")
+            }
+            XCTAssertEqual(name, ModelNames.ASR.preprocessorFile)
+            XCTAssertEqual(path, directory.appendingPathComponent(ModelNames.ASR.preprocessorFile))
+        }
     }
 
     // MARK: - Neural Engine Optimization Tests
