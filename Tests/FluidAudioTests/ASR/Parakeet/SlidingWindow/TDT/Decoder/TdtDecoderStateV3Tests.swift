@@ -52,6 +52,20 @@ final class TdtDecoderStateV3Tests: XCTestCase {
         verifyArraysEqual(copiedState.cellState, originalState.cellState)
     }
 
+    func testCopyInitializationDeepCopiesPredictorOutput() throws {
+        var originalState = try TdtDecoderState()
+        let predictorOutput = try MLMultiArray(shape: [1, 4, 1], dataType: .float32)
+        fillArrayWithTestData(predictorOutput, multiplier: 3)
+        originalState.predictorOutput = predictorOutput
+
+        let copiedState = try TdtDecoderState(from: originalState)
+        let copiedPredictorOutput = try XCTUnwrap(copiedState.predictorOutput)
+        verifyArraysEqual(copiedPredictorOutput, predictorOutput)
+
+        predictorOutput[0] = -999
+        XCTAssertNotEqual(copiedPredictorOutput[0], predictorOutput[0])
+    }
+
     // MARK: - State Management Tests
 
     func testReset() throws {

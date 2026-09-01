@@ -74,6 +74,13 @@ public struct TdtDecoderState: Sendable {
 
         hiddenState.copyData(from: other.hiddenState)
         cellState.copyData(from: other.cellState)
+        if let otherPredictorOutput = other.predictorOutput {
+            predictorOutput = try MLMultiArray(
+                shape: otherPredictorOutput.shape,
+                dataType: otherPredictorOutput.dataType
+            )
+            predictorOutput?.copyData(from: otherPredictorOutput)
+        }
     }
 
     /// Reset all state variables to initial values

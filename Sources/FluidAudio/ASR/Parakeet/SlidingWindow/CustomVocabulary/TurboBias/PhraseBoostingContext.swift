@@ -2,6 +2,21 @@
 // Copyright NVIDIA Corporation, licensed under Apache License 2.0.
 import Foundation
 
+/// Search strategy used after a phrase graph has been prepared.
+///
+/// Beam search is deliberately opt-in. It requires the full-vocabulary joint on every
+/// active hypothesis, while greedy decoding can often prove that the optimized scalar
+/// joint's winner is unbeatable without running that model.
+public enum PhraseBoostingDecoder: Sendable, Equatable {
+    case greedy
+    case beam(width: Int)
+
+    var beamWidth: Int? {
+        guard case .beam(let width) = self else { return nil }
+        return width
+    }
+}
+
 /// Decode-time phrase boosting parameters from NVIDIA NeMo's TurboBias implementation.
 ///
 /// The effective token score is `acoustic + alpha * graphTransition`. NeMo's published
@@ -20,6 +35,9 @@ public struct PhraseBoostingConfig: Sendable, Equatable {
     /// Prevent character-by-character paths from receiving an earlier/larger reward
     /// than the original greedy BPE path.
     public let penalizeSubsplits: Bool
+    /// Search strategy for dictionary-assisted decoding. Greedy remains the default
+    /// so existing callers and the ordinary low-latency path are unchanged.
+    public let decoder: PhraseBoostingDecoder
 
     public init(
         contextScore: Float = 1,
@@ -28,7 +46,8 @@ public struct PhraseBoostingConfig: Sendable, Equatable {
         unknownScore: Float = 0,
         caseInsensitive: Bool = true,
         variativeScoringTemperature: Float = 10,
-        penalizeSubsplits: Bool = true
+        penalizeSubsplits: Bool = true,
+        decoder: PhraseBoostingDecoder = .greedy
     ) {
         self.contextScore = contextScore
         self.depthScaling = depthScaling
@@ -37,6 +56,7 @@ public struct PhraseBoostingConfig: Sendable, Equatable {
         self.caseInsensitive = caseInsensitive
         self.variativeScoringTemperature = variativeScoringTemperature
         self.penalizeSubsplits = penalizeSubsplits
+        self.decoder = decoder
     }
 }
 
@@ -179,7 +199,8 @@ public struct PhraseBoostingContext: Sendable {
             config.alpha.isFinite, config.alpha >= 0,
             config.unknownScore.isFinite, config.unknownScore >= 0,
             config.variativeScoringTemperature.isFinite,
-            config.variativeScoringTemperature >= 0
+            config.variativeScoringTemperature >= 0,
+            config.decoder.beamWidth.map({ (2...32).contains($0) }) ?? true
         else {
             throw PhraseBoostingError.invalidConfiguration
         }
@@ -285,6 +306,59 @@ public struct PhraseBoostingContext: Sendable {
                 guard let scalar = piece.unicodeScalars.first else { return token }
                 return CharacterSet.alphanumerics.contains(scalar) ? nil : token
             })
+    }
+
+    struct BeamTokenCandidate: Sendable, Equatable {
+        let token: Int
+        let nextState: Int
+        let acousticLogProbability: Float
+        let fusedLogProbability: Float
+    }
+
+    /// Return the strongest non-blank token expansions after TurboBias shallow fusion.
+    ///
+    /// This is the CPU/Core ML equivalent of NeMo's fusion-before-top-k beam operation.
+    /// It intentionally scores the complete vocabulary: pruning acoustic tokens before
+    /// adding graph rewards would make it impossible to rescue a rare dictionary token.
+    func beamTokenCandidates(
+        acousticLogProbabilities: [Float],
+        state: Int,
+        limit: Int
+    ) -> [BeamTokenCandidate] {
+        guard limit > 0 else { return [] }
+        let candidateCount = min(blankID, acousticLogProbabilities.count)
+        var candidates = [BeamTokenCandidate]()
+        candidates.reserveCapacity(candidateCount)
+        for token in 0..<candidateCount {
+            let acoustic = acousticLogProbabilities[token]
+            guard acoustic.isFinite else { continue }
+            let graph = transition(from: state, token: token)
+            candidates.append(
+                BeamTokenCandidate(
+                    token: token,
+                    nextState: graph.nextState,
+                    acousticLogProbability: acoustic,
+                    fusedLogProbability: acoustic + config.alpha * graph.score
+                )
+            )
+        }
+        if candidates.count > limit {
+            candidates.sort {
+                if $0.fusedLogProbability == $1.fusedLogProbability {
+                    return $0.token < $1.token
+                }
+                return $0.fusedLogProbability > $1.fusedLogProbability
+            }
+            candidates.removeSubrange(limit...)
+        } else {
+            candidates.sort {
+                if $0.fusedLogProbability == $1.fusedLogProbability {
+                    return $0.token < $1.token
+                }
+                return $0.fusedLogProbability > $1.fusedLogProbability
+            }
+        }
+        return candidates
     }
 
     private static func addGreedyPhrase(

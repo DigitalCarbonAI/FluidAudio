@@ -22,6 +22,59 @@ internal struct TdtDecoderV2 {
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0
     ) async throws -> TdtHypothesis {
+        if phraseBoostingContext?.config.decoder.beamWidth != nil {
+            guard let phraseBoostingJointModel, let phraseBoostingContext else {
+                var result = try await greedyDecode(
+                    encoderOutput: encoderOutput,
+                    encoderSequenceLength: encoderSequenceLength,
+                    actualAudioFrames: actualAudioFrames,
+                    decoderModel: decoderModel,
+                    jointModel: jointModel,
+                    decoderState: &decoderState,
+                    contextFrameAdjustment: contextFrameAdjustment,
+                    isLastChunk: isLastChunk,
+                    globalFrameOffset: globalFrameOffset
+                )
+                result.phraseBoostingFailureReason = .jointUnavailable
+                return result
+            }
+            do {
+                let beamDecoder = TdtBeamDecoderV2(config: config)
+                return try await beamDecoder.decodeWithTimings(
+                    encoderOutput: encoderOutput,
+                    encoderSequenceLength: encoderSequenceLength,
+                    actualAudioFrames: actualAudioFrames,
+                    decoderModel: decoderModel,
+                    phraseBoostingJointModel: phraseBoostingJointModel,
+                    phraseBoostingContext: phraseBoostingContext,
+                    decoderState: &decoderState,
+                    contextFrameAdjustment: contextFrameAdjustment,
+                    isLastChunk: isLastChunk,
+                    globalFrameOffset: globalFrameOffset
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Beam state is kept local until success. If its optional full-joint path
+                // fails, the untouched incoming state can still produce the ordinary
+                // primary transcript without rerunning the encoder.
+                var result = try await greedyDecode(
+                    encoderOutput: encoderOutput,
+                    encoderSequenceLength: encoderSequenceLength,
+                    actualAudioFrames: actualAudioFrames,
+                    decoderModel: decoderModel,
+                    jointModel: jointModel,
+                    decoderState: &decoderState,
+                    contextFrameAdjustment: contextFrameAdjustment,
+                    isLastChunk: isLastChunk,
+                    globalFrameOffset: globalFrameOffset
+                )
+                result.phraseBoostingFailureReason =
+                    (error as? TdtPhraseBoostingBeamError)?.failureReason ?? .predictionFailed
+                return result
+            }
+        }
+
         let decoder = TdtDecoderV3(config: config)
         return try await decoder.decodeWithTimings(
             encoderOutput: encoderOutput,
@@ -31,6 +84,31 @@ internal struct TdtDecoderV2 {
             jointModel: jointModel,
             phraseBoostingJointModel: phraseBoostingJointModel,
             phraseBoostingContext: phraseBoostingContext,
+            decoderState: &decoderState,
+            contextFrameAdjustment: contextFrameAdjustment,
+            isLastChunk: isLastChunk,
+            globalFrameOffset: globalFrameOffset
+        )
+    }
+
+    private func greedyDecode(
+        encoderOutput: MLMultiArray,
+        encoderSequenceLength: Int,
+        actualAudioFrames: Int,
+        decoderModel: MLModel,
+        jointModel: MLModel,
+        decoderState: inout TdtDecoderState,
+        contextFrameAdjustment: Int,
+        isLastChunk: Bool,
+        globalFrameOffset: Int
+    ) async throws -> TdtHypothesis {
+        let decoder = TdtDecoderV3(config: config)
+        return try await decoder.decodeWithTimings(
+            encoderOutput: encoderOutput,
+            encoderSequenceLength: encoderSequenceLength,
+            actualAudioFrames: actualAudioFrames,
+            decoderModel: decoderModel,
+            jointModel: jointModel,
             decoderState: &decoderState,
             contextFrameAdjustment: contextFrameAdjustment,
             isLastChunk: isLastChunk,

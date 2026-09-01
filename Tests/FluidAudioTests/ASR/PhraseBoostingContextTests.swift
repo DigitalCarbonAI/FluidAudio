@@ -194,6 +194,66 @@ final class PhraseBoostingContextTests: XCTestCase {
         )
     }
 
+    func testBeamFusionKeepsAcousticAndBoostedAlternatives() throws {
+        let context = try PhraseBoostingContext(
+            phrases: ["codex"],
+            vocabulary: vocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig(
+                alpha: 1,
+                decoder: .beam(width: 2)
+            )
+        )
+        let phraseToken = try XCTUnwrap(context.tokenizedPhrases[0].first)
+        var logProbabilities = Array(repeating: Float(-100), count: 1_025)
+        logProbabilities[7] = 0
+        logProbabilities[phraseToken] = -0.5
+
+        let candidates = context.beamTokenCandidates(
+            acousticLogProbabilities: logProbabilities,
+            state: context.rootState,
+            limit: 2
+        )
+
+        XCTAssertEqual(candidates.map(\.token), [phraseToken, 7])
+        XCTAssertGreaterThan(candidates[0].fusedLogProbability, candidates[1].fusedLogProbability)
+        XCTAssertNotEqual(candidates[0].nextState, context.rootState)
+        XCTAssertEqual(candidates[1].nextState, context.rootState)
+    }
+
+    func testBeamWidthMustBeBounded() {
+        for invalidWidth in [0, 1, 33] {
+            XCTAssertThrowsError(
+                try PhraseBoostingContext(
+                    phrases: ["codex"],
+                    vocabulary: vocabulary,
+                    blankID: 1_024,
+                    config: PhraseBoostingConfig(decoder: .beam(width: invalidWidth))
+                )
+            ) { error in
+                XCTAssertEqual(error as? PhraseBoostingError, .invalidConfiguration)
+            }
+        }
+    }
+
+    func testBeamSearchMathUsesStableLogProbabilitiesAndTieBreaking() {
+        let logProbabilities = TdtBeamSearchMath.logSoftmax([1_000, 1_000][...])
+
+        XCTAssertEqual(logProbabilities.count, 2)
+        XCTAssertEqual(
+            Foundation.exp(Double(logProbabilities[0]))
+                + Foundation.exp(Double(logProbabilities[1])),
+            1,
+            accuracy: 1e-6
+        )
+        XCTAssertEqual(TdtBeamSearchMath.topIndices(in: [1, 1, 0], limit: 2), [0, 1])
+        XCTAssertEqual(
+            TdtBeamSearchMath.logAddExp(-2, -2),
+            -2 + Foundation.log(Float(2)),
+            accuracy: 1e-6
+        )
+    }
+
     func testReplacementReportsTokenOnlyAcousticProbability() throws {
         let context = try PhraseBoostingContext(
             phrases: ["codex"],
@@ -505,5 +565,9 @@ final class PhraseBoostingContextTests: XCTestCase {
         XCTAssertFalse(PhraseBoostingFailureReason.workspaceUnavailable.requiresResourceRepair)
         XCTAssertTrue(PhraseBoostingFailureReason.jointUnavailable.requiresResourceRepair)
         XCTAssertTrue(PhraseBoostingFailureReason.predictionFailed.requiresResourceRepair)
+    }
+
+    func testGreedyDecoderRemainsTheDefault() {
+        XCTAssertEqual(PhraseBoostingConfig().decoder, .greedy)
     }
 }
