@@ -1,5 +1,6 @@
 // The context graph and variative-BPE construction are derived from NVIDIA NeMo Speech,
 // Copyright NVIDIA Corporation, licensed under Apache License 2.0.
+import ContextBiasing
 import Foundation
 
 /// Decode-time phrase boosting parameters from NVIDIA NeMo's TurboBias implementation.
@@ -77,34 +78,9 @@ public struct PhraseBoostingContext: Sendable {
         let replacementProbability: Float?
     }
 
-    private struct Transition: Sendable {
-        let nextState: Int
-        let score: Float
-    }
-
-    fileprivate struct TokenWithLength: Sendable {
-        let token: Int
-        let length: Int
-    }
-
-    fileprivate struct VariativeRepresentation: Sendable {
-        let canonicalLengths: [Int]
-        let tokenGroups: [[TokenWithLength]]
-    }
-
-    private struct Node: Sendable {
-        var children: [Int: Int] = [:]
-        /// Character-level backbone used to calculate Aho-Corasick failure links.
-        /// Variative and merged-token arcs live only in `children`.
-        var primaryChildren: [Int: Int] = [:]
-        var fail = 0
-        var tokenScore: Float = 0
-        var nodeScore: Float = 0
-        var isEnd = false
-        var phraseIndices: [Int] = []
-        var outputPhraseIndices: [Int] = []
-        var formattingPhraseIndices: [Int] = []
-    }
+    private typealias Transition = PhraseBoostingGraph.Transition
+    fileprivate typealias TokenWithLength = VariativeBPERepresentation.TokenWithLength
+    fileprivate typealias VariativeRepresentation = VariativeBPERepresentation
 
     public let phrases: [String]
     public let tokenizedPhrases: [[Int]]
@@ -112,7 +88,8 @@ public struct PhraseBoostingContext: Sendable {
     public let skippedPhraseCount: Int
 
     let blankID: Int
-    private let nodes: [Node]
+    private let graph: PhraseBoostingGraph
+    private let formattingPhraseIndices: Set<Int>
     private let phraseEndBoundaryTokens: Set<Int>
     private let maximumRootTransitionScore: Float
 
@@ -231,220 +208,32 @@ public struct PhraseBoostingContext: Sendable {
             throw PhraseBoostingError.untokenizablePhrase(firstUnsupportedPhrase ?? "")
         }
 
-        var buildingNodes = [Node()]
-        for (phraseIndex, phrase) in acceptedPhrases.enumerated() {
-            let terminalState: Int
-            if config.caseInsensitive {
-                guard let representation = variativeRepresentations[phraseIndex] else {
-                    preconditionFailure("Case-insensitive phrase lost its variative representation")
-                }
-                terminalState = Self.addVariativePhrase(
-                    representation,
-                    config: config,
-                    to: &buildingNodes
-                )
-            } else {
-                terminalState = Self.addGreedyPhrase(
-                    tokenizedPhrases[phraseIndex],
-                    config: config,
-                    to: &buildingNodes
-                )
-            }
-
-            buildingNodes[terminalState].isEnd = true
-            if !buildingNodes[terminalState].phraseIndices.contains(phraseIndex) {
-                buildingNodes[terminalState].phraseIndices.append(phraseIndex)
-            }
-            if config.caseInsensitive,
-                phrase.lowercased() != phrase,
-                !buildingNodes[terminalState].formattingPhraseIndices.contains(phraseIndex)
-            {
-                buildingNodes[terminalState].formattingPhraseIndices.append(phraseIndex)
-            }
-        }
-
-        for index in buildingNodes.indices {
-            buildingNodes[index].outputPhraseIndices = buildingNodes[index].phraseIndices
-        }
-
-        Self.fillFailureLinks(in: &buildingNodes)
-
+        let graph = try PhraseBoostingGraph(
+            phrases: tokenizedPhrases.indices.map {
+                PhraseGraphInput(tokens: tokenizedPhrases[$0], variative: variativeRepresentations[$0])
+            },
+            config: PhraseGraphConfiguration(
+                contextScore: config.contextScore, depthScaling: config.depthScaling,
+                unknownScore: config.unknownScore,
+                variativeScoringTemperature: config.variativeScoringTemperature,
+                penalizeSubsplits: config.penalizeSubsplits))
         self.phrases = acceptedPhrases
         self.tokenizedPhrases = tokenizedPhrases
         self.config = config
         self.skippedPhraseCount = skippedPhrases
         self.blankID = blankID
-        self.nodes = buildingNodes
-        self.maximumRootTransitionScore = max(
-            config.unknownScore,
-            buildingNodes[0].children.values.map { buildingNodes[$0].nodeScore }.max() ?? 0
-        )
+        self.graph = graph
+        self.maximumRootTransitionScore = graph.maximumRootTransitionScore
+        self.formattingPhraseIndices = Set(
+            acceptedPhrases.indices.filter {
+                config.caseInsensitive && acceptedPhrases[$0].lowercased() != acceptedPhrases[$0]
+            })
         self.phraseEndBoundaryTokens = Set(
             vocabulary.compactMap { token, piece in
                 if piece.hasPrefix(ASRConstants.sentencePieceWordBoundary) { return token }
                 guard let scalar = piece.unicodeScalars.first else { return token }
                 return CharacterSet.alphanumerics.contains(scalar) ? nil : token
             })
-    }
-
-    private static func addGreedyPhrase(
-        _ tokens: [Int],
-        config: PhraseBoostingConfig,
-        to nodes: inout [Node]
-    ) -> Int {
-        var state = 0
-        for (depth, token) in tokens.enumerated() {
-            let tokenScore = score(depth: depth, config: config)
-            if let existing = nodes[state].children[token] {
-                let sharedScore = max(tokenScore, nodes[existing].tokenScore)
-                nodes[existing].tokenScore = sharedScore
-                nodes[existing].nodeScore = nodes[state].nodeScore + sharedScore
-                nodes[state].primaryChildren[token] = existing
-                state = existing
-            } else {
-                let next = nodes.count
-                nodes.append(
-                    Node(
-                        tokenScore: tokenScore,
-                        nodeScore: nodes[state].nodeScore + tokenScore
-                    )
-                )
-                nodes[state].children[token] = next
-                nodes[state].primaryChildren[token] = next
-                state = next
-            }
-        }
-        return state
-    }
-
-    /// Port of NeMo `ContextGraph.build_from_var_bpe` used by TurboBias 2.0.
-    /// Character states are the scoring backbone; case and merged-token arcs
-    /// converge on those states, so every valid BPE segmentation earns the same
-    /// total phrase reward.
-    private static func addVariativePhrase(
-        _ representation: VariativeRepresentation,
-        config: PhraseBoostingConfig,
-        to nodes: inout [Node]
-    ) -> Int {
-        let tokenCount = representation.tokenGroups.count
-        var tokenScores = [Float](repeating: 0, count: tokenCount)
-        var isPrimaryEndpoint = [Bool](repeating: false, count: tokenCount)
-        var primaryScores = [Float](repeating: 0, count: tokenCount)
-        var primaryBackJumps = [Int](repeating: 0, count: tokenCount)
-
-        var offset = 0
-        for (depth, canonicalLength) in representation.canonicalLengths.enumerated() {
-            let endpoint = offset + canonicalLength - 1
-            isPrimaryEndpoint[endpoint] = true
-            let primaryScore = score(depth: depth, config: config)
-            let weights = softmaxWeights(
-                count: canonicalLength,
-                temperature: config.variativeScoringTemperature
-            )
-            for index in 0..<canonicalLength {
-                tokenScores[offset + index] = primaryScore * weights[index]
-            }
-            primaryScores[endpoint] = primaryScore
-            primaryBackJumps[endpoint] = canonicalLength
-            offset += canonicalLength
-        }
-
-        var state = 0
-        var statesByCanonicalPosition = [0]
-        var accumulatedScore: Float = 0
-
-        for index in representation.tokenGroups.indices {
-            let group = representation.tokenGroups[index]
-            precondition(!group.isEmpty)
-            let primaryToken = group[0].token
-            accumulatedScore += tokenScores[index]
-            let nextState: Int
-
-            if let existing = nodes[state].children[primaryToken] {
-                nextState = existing
-                nodes[state].primaryChildren[primaryToken] = existing
-            } else {
-                let potential: Float
-                if config.penalizeSubsplits, !isPrimaryEndpoint[index] {
-                    potential = max(0, accumulatedScore - nodes[state].nodeScore)
-                } else {
-                    potential = accumulatedScore
-                }
-                nextState = nodes.count
-                nodes.append(Node(nodeScore: potential))
-                nodes[state].children[primaryToken] = nextState
-                nodes[state].primaryChildren[primaryToken] = nextState
-            }
-
-            if isPrimaryEndpoint[index] {
-                let sourceIndex = statesByCanonicalPosition.count - primaryBackJumps[index]
-                let primaryPotential =
-                    nodes[statesByCanonicalPosition[sourceIndex]].nodeScore + primaryScores[index]
-                nodes[nextState].nodeScore = max(nodes[nextState].nodeScore, primaryPotential)
-            }
-
-            for alternative in group.dropFirst() {
-                if alternative.length == 1 {
-                    nodes[state].children[alternative.token] = nextState
-                } else {
-                    let sourceIndex = statesByCanonicalPosition.count - alternative.length
-                    nodes[statesByCanonicalPosition[sourceIndex]].children[alternative.token] = nextState
-                }
-            }
-
-            statesByCanonicalPosition.append(nextState)
-            state = nextState
-        }
-        return state
-    }
-
-    private static func fillFailureLinks(in nodes: inout [Node]) {
-        var queue = Array(nodes[0].primaryChildren.values)
-        var queueIndex = 0
-        var visited: Set<Int> = [0]
-        for child in queue {
-            nodes[child].fail = 0
-        }
-
-        while queueIndex < queue.count {
-            let current = queue[queueIndex]
-            queueIndex += 1
-            guard visited.insert(current).inserted else { continue }
-
-            for (token, child) in nodes[current].primaryChildren where !visited.contains(child) {
-                var failure = nodes[current].fail
-                while failure != 0 && nodes[failure].primaryChildren[token] == nil {
-                    failure = nodes[failure].fail
-                }
-                if let suffix = nodes[failure].primaryChildren[token], suffix != child {
-                    nodes[child].fail = suffix
-                } else {
-                    nodes[child].fail = 0
-                }
-                for phraseIndex in nodes[nodes[child].fail].outputPhraseIndices
-                where !nodes[child].outputPhraseIndices.contains(phraseIndex) {
-                    nodes[child].outputPhraseIndices.append(phraseIndex)
-                }
-                queue.append(child)
-            }
-        }
-    }
-
-    private static func score(depth: Int, config: PhraseBoostingConfig) -> Float {
-        guard depth > 0 else { return config.contextScore }
-        return config.contextScore * config.depthScaling
-            + Float(Foundation.log(Double(depth + 1)))
-    }
-
-    private static func softmaxWeights(count: Int, temperature: Float) -> [Float] {
-        guard count > 1 else { return [1] }
-        let logits = (0..<count).map {
-            Foundation.pow(Double($0 + 1), Double(temperature))
-        }
-        let maximum = logits.max() ?? 0
-        let exponentials = logits.map { Foundation.exp($0 - maximum) }
-        let denominator = exponentials.reduce(0, +)
-        return exponentials.map { Float($0 / denominator) }
     }
 
     /// Re-select a non-blank greedy token after shallow fusion with the phrase graph.
@@ -527,7 +316,7 @@ public struct PhraseBoostingContext: Sendable {
         for (index, token) in tokens.enumerated() {
             state = transition(from: state, token: token).nextState
             guard isPhraseEndBoundary(at: index + 1, tokens: tokens) else { continue }
-            for phraseIndex in nodes[state].outputPhraseIndices {
+            for phraseIndex in graph.matchingPhraseIndices(at: state) {
                 matched.insert(phraseIndex)
             }
         }
@@ -574,11 +363,12 @@ public struct PhraseBoostingContext: Sendable {
         var index = startIndex
         var best: (phraseIndex: Int, length: Int)?
 
-        while index < tokens.count, let child = nodes[state].children[tokens[index]] {
+        while index < tokens.count, let child = graph.child(from: state, token: tokens[index]) {
             state = child
             index += 1
             guard isPhraseEndBoundary(at: index, tokens: tokens) else { continue }
-            for phraseIndex in nodes[state].formattingPhraseIndices {
+            for phraseIndex in graph.terminalPhraseIndices(at: state)
+            where formattingPhraseIndices.contains(phraseIndex) {
                 let length = index - startIndex
                 if let current = best {
                     if length > current.length
@@ -603,24 +393,9 @@ public struct PhraseBoostingContext: Sendable {
     }
 
     private func transition(from originalState: Int, token: Int) -> Transition {
-        var state = nodes.indices.contains(originalState) ? originalState : rootState
-        var score: Float = 0
-
-        while state != rootState && nodes[state].children[token] == nil {
-            let failure = nodes[state].fail
-            // NeMo deliberately does not remove a completed phrase's reward on backoff.
-            if !nodes[state].isEnd {
-                score += nodes[failure].nodeScore - nodes[state].nodeScore
-            }
-            state = failure
-        }
-
-        guard let next = nodes[state].children[token] else {
-            return Transition(nextState: rootState, score: score + config.unknownScore)
-        }
-        score += nodes[next].nodeScore - nodes[state].nodeScore
-        return Transition(nextState: next, score: score)
+        graph.transition(from: originalState, token: token)
     }
+
 }
 
 /// SentencePiece BPE encoding reconstructed from the ordered Parakeet vocabulary.
@@ -629,65 +404,14 @@ public struct PhraseBoostingContext: Sendable {
 /// `-(id - 1)`). This produces the same token IDs without bundling a second tokenizer asset.
 private struct ParakeetSentencePieceBPETokenizer {
     private let tokenToID: [String: Int]
-    private let canonicalIDByTokenID: [Int: Int]
-    private let alternativesByCanonicalID: [Int: [Int]]
-    private let canonicalSplitByTokenID: [Int: [Int]]
-    private let tokenIDsByCanonicalSplit: [[Int]: [Int]]
-    private let maximumTokenLength: Int
+    private let variants: VariativeBPEVocabulary
 
     init(vocabulary: [Int: String], blankID: Int) {
+        let usable = vocabulary.filter { $0.key >= 0 && $0.key < blankID && $0.value != "<unk>" }
         var byPiece: [String: Int] = [:]
-        for (id, piece) in vocabulary where id >= 0 && id < blankID && piece != "<unk>" {
-            byPiece[piece] = min(id, byPiece[piece] ?? id)
-        }
+        for (id, piece) in usable { byPiece[piece] = min(id, byPiece[piece] ?? id) }
         tokenToID = byPiece
-
-        var canonicalIDs: [Int: Int] = [:]
-        for (piece, id) in byPiece {
-            let lowercase = piece.lowercased()
-            canonicalIDs[id] = lowercase != piece ? (byPiece[lowercase] ?? id) : id
-        }
-        canonicalIDByTokenID = canonicalIDs
-
-        var alternatives: [Int: [Int]] = [:]
-        for id in canonicalIDs.keys.sorted() {
-            guard let canonicalID = canonicalIDs[id] else { continue }
-            alternatives[canonicalID, default: []].append(id)
-        }
-        for canonicalID in Array(alternatives.keys) {
-            alternatives[canonicalID]?.sort { left, right in
-                if left == canonicalID { return true }
-                if right == canonicalID { return false }
-                return left < right
-            }
-        }
-        alternativesByCanonicalID = alternatives
-
-        var splits: [Int: [Int]] = [:]
-        var bySplit: [[Int]: [Int]] = [:]
-        var maxLength = 1
-        for (piece, id) in byPiece {
-            let canonicalID = canonicalIDs[id] ?? id
-            let split: [Int]
-            if piece.count == 1 || (piece.hasPrefix("<") && piece.hasSuffix(">")) {
-                split = [canonicalID]
-            } else {
-                let candidate = piece.compactMap { character -> Int? in
-                    guard let characterID = byPiece[String(character)] else { return nil }
-                    return canonicalIDs[characterID] ?? characterID
-                }
-                split = candidate.count == piece.count ? candidate : [canonicalID]
-            }
-            splits[id] = split
-            bySplit[split, default: []].append(id)
-            maxLength = max(maxLength, split.count)
-        }
-        for split in Array(bySplit.keys) {
-            bySplit[split]?.sort()
-        }
-        canonicalSplitByTokenID = splits
-        tokenIDsByCanonicalSplit = bySplit
-        maximumTokenLength = maxLength
+        variants = VariativeBPEVocabulary(vocabulary: usable, segmentation: .graphemes)
     }
 
     func encode(_ text: String) -> [Int]? {
@@ -716,47 +440,8 @@ private struct ParakeetSentencePieceBPETokenizer {
         return ids.count == pieces.count ? ids : nil
     }
 
-    /// NeMo TurboBias 2.0 variative-BPE representation. The phrase's greedy
-    /// BPE tokens define score boundaries, while the graph accepts every vocab
-    /// token whose lowercased character decomposition covers the same span.
-    func variativeRepresentation(
-        for text: String
-    ) -> PhraseBoostingContext.VariativeRepresentation? {
-        guard let greedyIDs = encode(text), !greedyIDs.isEmpty else { return nil }
-        let canonicalLengths = greedyIDs.compactMap { canonicalSplitByTokenID[$0]?.count }
-        guard canonicalLengths.count == greedyIDs.count else { return nil }
-        let canonicalIDs = greedyIDs.flatMap { canonicalSplitByTokenID[$0] ?? [] }
-        guard canonicalIDs.count == canonicalLengths.reduce(0, +) else { return nil }
-
-        var groups = [[PhraseBoostingContext.TokenWithLength]]()
-        groups.reserveCapacity(canonicalIDs.count)
-        for index in canonicalIDs.indices {
-            let canonicalID = canonicalIDs[index]
-            var group = (alternativesByCanonicalID[canonicalID] ?? [canonicalID]).map {
-                PhraseBoostingContext.TokenWithLength(token: $0, length: 1)
-            }
-
-            let earliestStart = max(0, index - maximumTokenLength)
-            if earliestStart < index {
-                for start in earliestStart..<index {
-                    let split = Array(canonicalIDs[start...index])
-                    for token in tokenIDsByCanonicalSplit[split] ?? []
-                    where !group.contains(where: { $0.token == token }) {
-                        group.append(
-                            PhraseBoostingContext.TokenWithLength(
-                                token: token,
-                                length: index - start + 1
-                            )
-                        )
-                    }
-                }
-            }
-            guard !group.isEmpty else { return nil }
-            groups.append(group)
-        }
-        return PhraseBoostingContext.VariativeRepresentation(
-            canonicalLengths: canonicalLengths,
-            tokenGroups: groups
-        )
+    func variativeRepresentation(for text: String) -> VariativeBPERepresentation? {
+        guard let ids = encode(text) else { return nil }
+        return variants.representation(for: ids)
     }
 }

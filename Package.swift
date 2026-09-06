@@ -9,6 +9,7 @@ let package = Package(
         .iOS(.v17),
     ],
     products: [
+        .library(name: "ContextBiasing", targets: ["ContextBiasing"]),
         .library(
             name: "FluidAudio",
             targets: ["FluidAudio"]
@@ -20,9 +21,12 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
+        .target(name: "ContextBiasing"),
+        .testTarget(name: "ContextBiasingTests", dependencies: ["ContextBiasing"]),
         .target(
             name: "FluidAudio",
             dependencies: [
+                "ContextBiasing",
                 "FastClusterWrapper",
                 "MachTaskSelfWrapper",
                 "NemoTextProcessing",
