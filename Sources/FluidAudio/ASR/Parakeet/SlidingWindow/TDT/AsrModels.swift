@@ -5,6 +5,13 @@ import Foundation
 public enum AsrModelVersion: Sendable {
     case v2
     case v3
+    /// Parakeet Redux (moondream): ternary re-training of v3. Same vocabulary,
+    /// blank id, window and JointDecisionv3 contract; only the weights differ,
+    /// so every v3 decode path applies (see `isV3Family`).
+    case redux
+    /// Parakeet Ultra (moondream): full-precision post-training of v3. Same
+    /// architecture and contract as v3; the encoder ships int8-linear.
+    case ultra
     /// 110M parameter hybrid TDT-CTC model with fused preprocessor+encoder
     case tdtCtc110m
     /// 600M parameter TDT model for Japanese (ja) - hybrid CTC preprocessor/encoder + TDT decoder/joint v2
@@ -14,6 +21,8 @@ public enum AsrModelVersion: Sendable {
         switch self {
         case .v2: return .parakeetV2
         case .v3: return .parakeetV3
+        case .redux: return .parakeetRedux
+        case .ultra: return .parakeetUltra
         case .tdtCtc110m: return .parakeetTdtCtc110m
         case .tdtJa: return .parakeetJa
         }
@@ -40,7 +49,7 @@ public enum AsrModelVersion: Sendable {
     public var blankId: Int {
         switch self {
         case .v2, .tdtCtc110m: return 1024
-        case .v3: return 8192
+        case .v3, .redux, .ultra: return 8192
         case .tdtJa: return 3072
         }
     }
@@ -50,6 +59,16 @@ public enum AsrModelVersion: Sendable {
         switch self {
         case .tdtCtc110m: return 1
         default: return 2
+        }
+    }
+
+    /// v3 and its weight-compatible derivatives (Redux, Ultra). Gates the v3-only
+    /// decode behaviours: `TdtDecoderV3`, silence-aligned chunking, blank
+    /// recovery and the JointDecisionv3 top-K contract.
+    public var isV3Family: Bool {
+        switch self {
+        case .v3, .redux, .ultra: return true
+        default: return false
         }
     }
 }
@@ -157,7 +176,7 @@ extension AsrModels {
             joint: joint,
             ctcHead: ctcHead,
             configuration: config,
-            vocabulary: try loadVocabularyFile(
+            vocabulary: try parseVocabulary(
                 at: directory.appendingPathComponent(fileNames.vocabulary)),
             version: version
         )
@@ -212,6 +231,16 @@ extension AsrModels {
         ]
     }
 
+    /// Redux's 2-bit encoder uses iOS 18 Core ML ops, so it has no iOS 17 build.
+    /// Fails fast there and points at `.ultra` (same languages, more accurate).
+    static func checkPlatformSupport(for version: AsrModelVersion) throws {
+        guard version == .redux else { return }
+        if #available(macOS 15, iOS 18, *) { return }
+        throw AsrModelsError.loadingFailed(
+            "Parakeet Redux requires iOS 18 / macOS 15 (its 2-bit encoder uses iOS 18 Core ML ops). "
+                + "Use AsrModelVersion.ultra on iOS 17 / macOS 14.")
+    }
+
     /// Helper to get the repo path from a models directory
     private static func repoPath(from modelsDirectory: URL, version: AsrModelVersion = .v3) -> URL {
         return modelsDirectory.deletingLastPathComponent()
@@ -220,7 +249,7 @@ extension AsrModels {
 
     private static func inferredVersion(from directory: URL) -> AsrModelVersion? {
         let directoryPath = directory.path.lowercased()
-        let knownVersions: [AsrModelVersion] = [.tdtCtc110m, .v2, .v3, .tdtJa]
+        let knownVersions: [AsrModelVersion] = [.tdtCtc110m, .v2, .v3, .redux, .ultra, .tdtJa]
 
         for version in knownVersions {
             if directoryPath.contains(version.repo.folderName.lowercased()) {
@@ -258,6 +287,14 @@ extension AsrModels {
                 joint: Names.jointV3File,
                 vocabulary: Names.vocabularyFile
             )
+        case .redux, .ultra:
+            // Same contract as v3 with a single encoder build.
+            return (
+                encoder: Names.encoderFile,
+                decoder: Names.decoderFile,
+                joint: Names.jointV3File,
+                vocabulary: Names.vocabularyFile
+            )
         default:
             return (
                 encoder: Names.encoderFile,
@@ -277,9 +314,64 @@ extension AsrModels {
             return ModelNames.TDTJa.requiredModels
         case .v3:
             return Names.requiredModelsV3(precision: encoderPrecision)
+        case .redux, .ultra:
+            return Names.requiredModelsV3()
         default:
             return version.hasFusedEncoder ? Names.requiredModelsFused : Names.requiredModels
         }
+    }
+
+    /// Load compiled models from this exact directory without downloading or resolving a repository.
+    ///
+    /// Use this for compatible community weights such as Orukeet. The directory must contain
+    /// the version's `.mlmodelc` components and vocabulary; missing files fail locally.
+    /// Compile portable `.mlpackage` files on the destination device with `MLModel.compileModel(at:)`.
+    public static func loadLocal(
+        from directory: URL,
+        version: AsrModelVersion = .v3,
+        configuration: MLModelConfiguration? = nil,
+        encoderPrecision: ParakeetEncoderPrecision = .int8,
+        encoderComputeUnits: MLComputeUnits? = nil
+    ) throws -> AsrModels {
+        try checkPlatformSupport(for: version)
+        let config = configuration ?? defaultConfiguration()
+        let names = getModelFileNames(version: version, encoderPrecision: encoderPrecision)
+        func component(_ name: String, units: MLComputeUnits) throws -> MLModel {
+            let url = directory.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw AsrModelsError.modelNotFound(name, url)
+            }
+            let modelConfig = MLModelConfiguration()
+            modelConfig.computeUnits = units
+            modelConfig.allowLowPrecisionAccumulationOnGPU = config.allowLowPrecisionAccumulationOnGPU
+            return try MLModel(contentsOf: url, configuration: modelConfig)
+        }
+        let vocabularyURL = directory.appendingPathComponent(names.vocabulary)
+        let vocabulary = try parseVocabulary(at: vocabularyURL)
+        guard (0..<version.blankId).allSatisfy({ vocabulary[$0] != nil }) else {
+            throw AsrModelsError.loadingFailed("Local vocabulary must contain every token before the blank ID")
+        }
+        let encoder =
+            try version.hasFusedEncoder
+            ? nil
+            : component(
+                names.encoder,
+                units: encoderComputeUnits ?? config.computeUnits)
+        let ctcURL = directory.appendingPathComponent(Names.ctcHeadFile)
+        let ctcHead =
+            try FileManager.default.fileExists(atPath: ctcURL.path)
+            ? component(Names.ctcHeadFile, units: config.computeUnits) : nil
+        return try AsrModels(
+            encoder: encoder,
+            preprocessor: component(
+                Names.preprocessorFile, units: version.hasFusedEncoder ? config.computeUnits : .cpuOnly),
+            decoder: component(names.decoder, units: config.computeUnits),
+            joint: component(names.joint, units: config.computeUnits),
+            ctcHead: ctcHead,
+            configuration: config,
+            vocabulary: vocabulary,
+            version: version
+        )
     }
 
     /// Load ASR models from a directory
@@ -310,6 +402,7 @@ extension AsrModels {
         encoderComputeUnits: MLComputeUnits? = nil,
         progressHandler: ProgressHandler? = nil
     ) async throws -> AsrModels {
+        try checkPlatformSupport(for: version)
         logger.info("Loading ASR models from: \(directory.path)")
 
         let config = configuration ?? defaultConfiguration()
@@ -378,7 +471,7 @@ extension AsrModels {
 
         guard let jointModel = jointModels[fileNames.joint] else {
             let hint =
-                version == .v3
+                version.isV3Family
                 ? " (required for v3; delete the models directory to force a fresh download)"
                 : ""
             throw AsrModelsError.loadingFailed("Failed to load joint model \(fileNames.joint)\(hint)")
@@ -464,12 +557,11 @@ extension AsrModels {
         let vocabularyFileName = getModelFileNames(version: version, encoderPrecision: .int8).vocabulary
         let vocabPath = repoPath(from: directory, version: version).appendingPathComponent(vocabularyFileName)
 
-        return try loadVocabularyFile(at: vocabPath)
+        return try parseVocabulary(at: vocabPath)
     }
 
-    private static func loadVocabularyFile(at vocabPath: URL) throws -> [Int: String] {
+    private static func parseVocabulary(at vocabPath: URL) throws -> [Int: String] {
         let vocabularyFileName = vocabPath.lastPathComponent
-
         if !FileManager.default.fileExists(atPath: vocabPath.path) {
             logger.warning(
                 "Vocabulary file not found at \(vocabPath.path). Please ensure the vocab file is downloaded with the models."
@@ -590,6 +682,7 @@ extension AsrModels {
         encoderPrecision: ParakeetEncoderPrecision = .int8,
         progressHandler: ProgressHandler? = nil
     ) async throws -> URL {
+        try checkPlatformSupport(for: version)
         let targetDir = directory ?? defaultCacheDirectory(for: version)
         logger.info("Downloading ASR models to: \(targetDir.path)")
         let parentDir = targetDir.deletingLastPathComponent()

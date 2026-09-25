@@ -34,16 +34,20 @@ let package = Package(
             path: "Sources/FluidAudio",
             exclude: ["ASR/Parakeet/Unified/benchmark.md"],
             resources: [
-                .copy("TTS/LuxTts/G2p/Resources")
+                // Keep .process: .copy of a Resources-named directory breaks Apple code signing on iOS.
+                .process("TTS/LuxTts/G2p/Resources")
             ]
         ),
         // Byte-exact NeMo text normalization (FST engine, all 7 languages).
-        // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.0.
+        // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.1
+        // (macOS, iOS, iOS Simulator and Mac Catalyst slices).
+        // Always linked on tools < 6.2; Package@swift-6.2.swift exposes it as
+        // the opt-out `NemoTextProcessing` trait (#880, #888).
         .binaryTarget(
             name: "NemoTextProcessing",
             url:
-                "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.0/NemoTextProcessing.xcframework.zip",
-            checksum: "76d0ee9a32b1ee2193231299180ca9bc4fc7e98794e771b3d55d66498352d85f"
+                "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.1/NemoTextProcessing.xcframework.zip",
+            checksum: "5fa8c10d4ec26c1bb2413125f351a7222a4c68a23b74476680fbada7e26fc6aa"
         ),
         .target(
             name: "FastClusterWrapper",
@@ -72,7 +76,11 @@ let package = Package(
             ],
             exclude: ["ASR/Parakeet/SlidingWindow/CTC/sample_medical.arpa"],
             resources: [
-                .copy("TTS/LuxTts/Resources")
+                .process("TTS/LuxTts/Resources"),
+                .process("TTS/PocketTTS/Fixtures"),
+                // Real recordings (cleared for public release by the speaker) for the
+                // streaming final-window regression, issue #855.
+                .copy("ASR/Parakeet/SlidingWindow/Fixtures"),
             ]
         ),
     ],

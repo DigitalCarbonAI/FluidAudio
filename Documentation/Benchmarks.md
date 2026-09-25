@@ -91,6 +91,11 @@ Model: [FluidInference/parakeet-unified-en-0.6b-coreml](https://huggingface.co/F
 
 Hardware: Apple M5 Pro, macOS 26. Encoder int8 on ANE (`.cpuAndNeuralEngine`).
 
+> **iOS note:** the int8 encoder is verified on M-series only. On A16 (iPhone 14 Pro) it fails
+> to load on every compute unit — including `.cpuOnly` — even from an intact download
+> ([#828](https://github.com/FluidInference/FluidAudio/issues/828)). Use `encoderPrecision: .fp16`
+> on iOS; it loads and transcribes on the same device.
+
 ### LibriSpeech test-clean (2620 files, 5.40h audio)
 
 | Mode      | WER (Avg) | Aggregate WER | Median WER | Overall RTFx | Median RTFx | Long files (>15s) |
@@ -309,6 +314,37 @@ Peak memory usage (process-wide): 1.503 GB
 Model is nearly identical to the base model in terms of quality, performance wise we see an up to ~3.5x improvement compared to the silero Pytorch VAD model with the 256ms batch model (8 chunks of 32ms)
 
 ![VAD/speed.png](VAD/speed.png)
+
+### FSMN-VAD (`fsmn-vad-segment`)
+
+> **Beta:** FSMN-VAD is a beta model conversion; results and model artifacts may change.
+
+CoreML FSMN-VAD (FunASR, ~5.2M), an alternative to silero-vad. Model: [FluidInference/fsmn-vad-coreml](https://huggingface.co/FluidInference/fsmn-vad-coreml). 2-stage: fbank80+LFR preprocessor (fp32/CPU) → FSMN scorer (fp16/ANE, enumerated buckets) → host decision (port of FunASR `FsmnVADStreaming`). Hardware: Apple M5 Pro.
+
+Evaluated on the **mini50** labeled set via the standard `vad-benchmark` harness (per-clip speech/non-speech), same metric as the silero baseline:
+
+| Backend | Accuracy | Precision | Recall | F1 | RTFx |
+|---------|----------|-----------|--------|----|------|
+| silero (baseline) | 82.0% | 73.5% | 100% | 84.7% | 1408× |
+| **FSMN-VAD** | **98.0%** | **96.2%** | 100% | **98.0%** | 640× |
+
+FSMN-VAD is far more precise (96.2% vs 73.5%) at the same 100% recall — many fewer false speech detections — at ~640× real-time. Fidelity vs FunASR's own segments: frame F1 97.4%, boundaries within ~50 ms (`vad_bench.py` in the conversion repo).
+
+Full [FluidInference/musan](https://huggingface.co/datasets/FluidInference/musan) noise set (774 noise clips) — noise rejection / specificity (correctly classified non-speech):
+
+| Backend | Noise rejected (specificity) | False-positive rate | RTFx |
+|---------|------------------------------|---------------------|------|
+| silero | 69.8% | 30.2% | 1341× |
+| **FSMN-VAD** | **81.9%** | **18.1%** | 571× |
+
+On the full MUSAN noise set FSMN-VAD rejects 12 pp more noise as non-speech (18% vs 30% false positives) — consistently more precise than silero on both the balanced (mini50) and noise-heavy (full MUSAN) evaluations.
+
+Long audio is processed in ~30 s chunks (the FSMN's dilated conv needs fixed shapes; RangeDim is rejected by the ANE/BNNS compiler).
+
+```bash
+swift run -c release fluidaudiocli vad-benchmark --dataset mini50 --backend fsmn
+swift run -c release fluidaudiocli fsmn-vad-segment audio.wav
+```
 ![VAD/correlation.png](VAD/correlation.png)
 
 Silero VAD v6.2.1 Core ML preflight benchmark on an Apple M1 MacBook Air (`macOS 26.5.1`), using the same `mini50` dataset and threshold as the VAD CI workflow:
@@ -577,6 +613,27 @@ swift run -c release fluidaudiocli nemotron-multilingual-benchmark \
 
 Both offline and online versions use the community-1 model (via FluidInference/speaker-diarization-coreml).
 
+### CAM++ speaker embedding (`campplus-embed`)
+
+> **Beta:** CAM++ is a beta model conversion; results and model artifacts may change.
+
+CoreML CAM++ (FunASR, ~7.2M) speaker-embedding extractor. Model: [FluidInference/campplus-coreml](https://huggingface.co/FluidInference/campplus-coreml). 2-stage: fbank80 preprocessor (fp32/CPU) → CAM++ (RangeDim, CPU/GPU) → 192-d L2-normalized embedding. Hardware: Apple M5 Pro.
+
+| Metric | Value |
+|--------|-------|
+| **AISHELL-1 EER** | **0.48%** |
+| Same-speaker cosine (mean) | 0.805 |
+| Different-speaker cosine (mean) | 0.256 |
+| Trial set | 20 speakers, 6000 same / 6000 different pairs |
+
+**Notes:**
+- EER on AISHELL-1 (clean, read Mandarin) — easier than the official CN-Celeb benchmark (~6–7%); this validates the CoreML embedding discriminates speakers (CoreML↔torch embedding cosine 0.9997–0.99999).
+- Speaker id parsed from the AISHELL `name` field (`BAC009S0764W...` → `S0764`).
+
+```bash
+swift run -c release fluidaudiocli campplus-embed a.wav b.wav   # cosine similarity
+```
+
 ### Offline diarization pipeline
 
 For slightly ~1.2% worse DER we default to a higher step ratio segmentation duration than the baseline community-1 pipeline. This allows us to get nearly ~2x the speed (as expected because we're processing 1/2 of the embeddings). For highly critical use cases, one may should use step ratio = 0.1 and minSegmentDurationSeconds = 0.0
@@ -634,7 +691,7 @@ AVERAGE          10.6     17.4       5.4      2.0      3.3      -        323.2
 
 12/16 meetings detect the correct speaker count. Average DER 10.62% matches published pyannote-community-1 offline numbers on this split (~11-12%). Results are fully deterministic (two consecutive runs produce bit-identical metrics).
 
-**Clustering threshold matters on this split.** The table above uses `--threshold 0.7`. Since #616 the CLI default is the community-1 preset (0.6), which merges clusters more aggressively and undercounts speakers on 4 meetings (EN2002a 2/4 → 41.9% DER, ES2004d 3/4 → 34.8%, EN2002b 19.0%, IS1009d 16.4%), degrading the average to 15.5% DER. Pass `--threshold 0.7` (or set `clusteringThreshold: 0.7` in `OfflineDiarizerConfig`) for AMI-SDM-like meeting audio.
+**Clustering threshold matters on this split.** The table above predates #801 and uses `--threshold 0.7` under the old (inverted) threshold semantics. Since #801 the threshold is a Euclidean cut distance applied directly to the AHC dendrogram (pyannote parity): **larger values merge more aggressively and yield fewer speakers**. Old values map to new ones via `sqrt(2 − 2·old)` — the old default 0.6 behaved like a cut at 0.894, and the old `--threshold 0.7` from this table behaves like `--threshold 0.775` today. The CLI default remains the community-1 preset value (0.6), now interpreted as pyannote does.
 
 ### Streaming/online Diarization
 
@@ -996,3 +1053,95 @@ swift run -c release fluidaudiocli ja-benchmark --decoder tdt --dataset jsut --s
 | Mean RTFx | 28.9x |
 
 **Note:** CER calculation includes number normalization (full-width digits → half-width, kanji numbers → Arabic) matching NVIDIA's evaluation methodology. NVIDIA reports 6.4% CER for the same model on JSUT-basic5000.
+
+## CUA-S1-FORMS decision scoring
+
+Apple M5 Pro, 24 GB, macOS 27.0. Full published synthetic test: **24,370 decisions**,
+with no filtering or truncation. Batch-1 model-call timing excludes encoding, loading, and UI.
+
+| Model / backend | Correct decisions | Accuracy | Median | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Upstream PyTorch / CPU | 24,359 / 24,370 | 99.9549% | 1.787 ms | 3.104 ms |
+| Original FP16 Core ML / CPU + ANE | 24,359 / 24,370 | 99.9549% | 1.003 ms | 1.133 ms |
+| ANE-gather FP16 Core ML / CPU + ANE | 24,359 / 24,370 | 99.9549% | 1.052 ms | 1.177 ms |
+
+Both Core ML exports match PyTorch's selected option on **every row**, including
+the same 11 incorrect fill-for-skip decisions. ANE-gather is **4.8% slower** by
+median; the original remains the default.
+
+**Numerical parity fails for both exports:** 11 rows exceed the 0.005 probability-error
+limit (maximum 0.0204874), and one raw output fails the probability-sum check.
+The Swift runtime fix below handles that output; these accuracy numbers score raw model outputs.
+
+All 11 probability-error cases passed a focused FP32 CPU rerun (max error 0.0000012), pointing to FP16/backend rounding.
+
+[Full report](https://github.com/FluidInference/mobius/blob/main/models/computer-use/cua-s1-forms/coreml/reports/synthetic-test.json) ·
+[Dataset and reproduction](https://github.com/FluidInference/mobius/tree/main/models/computer-use/cua-s1-forms/coreml#full-published-synthetic-test) ·
+[Per-row trace](https://huggingface.co/FluidInference/cua-s1-forms-coreml/resolve/62ffd3653cf0edef7222a886e2006503e2367d10/reports/synthetic-test-decisions.jsonl.gz) ·
+[Swift API](API.md#decision-scoring)
+
+### INT8 weight trial
+
+A matched run over all **24,370 synthetic decisions** on the same M5 Pro:
+
+| Export | Package size | Accuracy | Median | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Original FP16 | 1.51 MB | 99.9549% | 0.990 ms | 1.102 ms |
+| INT8 weights, FP16 compute | 0.81 MB | 99.9549% | 0.990 ms | 1.104 ms |
+
+**46.2% smaller**, with every selected option unchanged and effectively identical
+latency. Numerical parity still fails: 64 rows exceed the 0.005 probability-error
+limit (maximum 0.067738), versus 11 for FP16. No INT8 probability-sum violations
+were observed. The original remains the default.
+
+Batch-1 Core ML CPU+ANE calls, excluding encoding/loading/UI; both models timed
+in the same process with alternating order. [Full report](https://github.com/FluidInference/mobius/blob/main/models/computer-use/cua-s1-forms/coreml/reports/int8-synthetic-test.json) ·
+[INT8 reproduction](https://github.com/FluidInference/mobius/tree/main/models/computer-use/cua-s1-forms/coreml#int8-weight-trial)
+
+### INT4 weight trial
+
+A matched run over all **24,370 synthetic decisions** on M5 Pro, CPU+ANE:
+
+| Export | Package size | Accuracy | Median | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 control, iOS 18 target | 1.51 MB | 99.9549% | 0.982 ms | 1.081 ms |
+| INT4 weights, FP16 compute | 0.45 MB | 99.9302% | 0.982 ms | 1.082 ms |
+
+**70.1% smaller**, with essentially unchanged latency. INT4 makes **17 errors
+versus 11** for FP16: 14 choices change, introducing 10 errors and correcting four.
+Numerical parity fails: 356 rows exceed the 0.005 probability-error limit
+(maximum 0.754359); no INT4 probability-sum violations were observed.
+
+Packed INT4 requires **iOS 18/macOS 15**. Both exports use the same decomposed
+attention graph and FP16 computation. Batch-1 timing excludes encoding/loading/UI.
+INT8 preserves all choices at 0.81 MB; the original FP16 remains the default.
+
+[Full report](https://github.com/FluidInference/mobius/blob/main/models/computer-use/cua-s1-forms/coreml/reports/int4-synthetic-test.json) ·
+[INT4 reproduction](https://github.com/FluidInference/mobius/tree/main/models/computer-use/cua-s1-forms/coreml#int4-weight-trial)
+
+### Swift probability fix
+
+Stable softmax in Swift fixes the FP16 probability-sum exception: **73,110/73,110 calls
+complete**, covering all 24,370 decisions for FP16, INT8, and INT4. Every selected
+option is unchanged; accuracy remains **99.9549%, 99.9549%, and 99.9302%**, respectively.
+Original model scores remain available as `rawProbabilities`; raw conversion-parity
+failures above remain. [Report and reproduction](https://github.com/FluidInference/mobius/tree/main/models/computer-use/cua-s1-forms/coreml#swift-probability-fix)
+
+### Swift runtime and ANE placement
+
+Separate release Swift benchmark: **200/200 correct per variant** over 50 demo
+controls. Timing includes Swift encoding, inference, and decoding; excludes UI.
+These timings predate the stable-softmax fix; complete SDK latency has not been remeasured.
+
+| Export | ANE operations | CPU operations | Swift median | Swift p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Original | 149 / 173 (86.1%) | 24 | 0.912 ms | 0.933 ms |
+| ANE-gather | 162 / 165 (98.2%) | 3 | 0.961 ms | 0.984 ms |
+
+Higher ANE placement is **5.4% slower** in Swift. Operation counts describe scheduler
+placement, not utilization or energy use. [Swift report](https://github.com/FluidInference/mobius/blob/main/models/computer-use/cua-s1-forms/coreml/reports/swift-variant-comparison.json) ·
+[Compute-plan profiles](https://github.com/FluidInference/mobius/tree/main/models/computer-use/cua-s1-forms/coreml#device-placement)
+
+Browser demonstration: **100/100 decisions** across patient, job, and insurance forms,
+with actual fill/check actions and verified DOM changes. [Recording](https://huggingface.co/FluidInference/cua-s1-forms-coreml/resolve/8b0c36f86a8b24f76f3dd866db62dbb2d2620a02/demo/browser-demo.mp4) ·
+[Browser report](https://github.com/FluidInference/mobius/blob/main/models/computer-use/cua-s1-forms/coreml/reports/browser-validation.json)

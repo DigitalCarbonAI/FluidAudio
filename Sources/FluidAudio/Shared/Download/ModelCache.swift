@@ -10,6 +10,45 @@ enum ModelCache {
     /// existing `category == "DownloadUtils"` predicates keep capturing the
     /// whole download trail; renaming it is a separate, opt-in decision.
     private static let logger = AppLogger(category: "DownloadUtils")
+    private static let revisionMarkerName = ".fluidaudio-revision"
+
+    /// Whether the managed cache contains files from `revision`.
+    ///
+    /// Historical `main` caches predate revision markers and remain valid. A
+    /// pinned revision always requires an exact marker so an SDK revision bump
+    /// cannot silently reuse files downloaded by an older release.
+    static func matchesRevision(at repoPath: URL, revision: String) -> Bool {
+        let marker = repoPath.appendingPathComponent(revisionMarkerName)
+        guard let data = try? Data(contentsOf: marker) else {
+            return revision == "main"
+        }
+        guard let storedRevision = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            return false
+        }
+        return storedRevision == revision
+    }
+
+    /// Prepare a managed cache for downloads from one resolved revision.
+    /// Existing files are preserved when the marker matches and replaced when
+    /// the requested revision changes. The marker is written before downloads
+    /// begin so interrupted files can resume on the next attempt.
+    static func prepareForDownload(at repoPath: URL, revision: String) throws {
+        let fm = FileManager.default
+        guard !matchesRevision(at: repoPath, revision: revision) else {
+            try fm.createDirectory(at: repoPath, withIntermediateDirectories: true)
+            return
+        }
+
+        if fm.fileExists(atPath: repoPath.path) {
+            try fm.removeItem(at: repoPath)
+        }
+        try fm.createDirectory(at: repoPath, withIntermediateDirectories: true)
+        guard revision != "main" else { return }
+
+        let marker = repoPath.appendingPathComponent(revisionMarkerName)
+        try Data((revision + "\n").utf8).write(to: marker, options: .atomic)
+    }
 
     /// Robustly create a directory, removing any conflicting files in the path.
     ///
@@ -114,6 +153,77 @@ enum ModelCache {
                     NSLocalizedDescriptionKey: "Missing coremldata.bin in model: \(name)",
                 ])
         }
+    }
+
+    /// The subset of `requiredFiles` that is missing or not load-ready under
+    /// `repoPath`, sorted for stable error reporting. Compiled bundles
+    /// (`.mlmodelc`) must pass `validateCompiledModelLayout` and contain no
+    /// `*.partial` download staging file; plain files must exist.
+    ///
+    /// This is the cache-validity check behind `ModelHub.loadWithRecovery`.
+    /// A bare directory-existence check passes for a bundle whose download
+    /// was interrupted mid-weights — leaving `weights/weight.bin.partial`
+    /// and no root `coremldata.bin` — which then fails every subsequent
+    /// `MLModel.load` while the downloader believes the cache is warm
+    /// (issue #819). This check reports such a bundle as incomplete so the
+    /// downloader re-runs and resumes the partial file.
+    static func incompleteFiles(at repoPath: URL, requiredFiles: Set<String>) -> [String] {
+        requiredFiles.filter { file in
+            let path = repoPath.appendingPathComponent(file)
+            if file.hasSuffix(".mlmodelc") {
+                guard (try? validateCompiledModelLayout(at: path, name: file)) != nil else { return true }
+                return containsPartialDownload(at: path)
+            }
+            return !FileManager.default.fileExists(atPath: path.path)
+        }.sorted()
+    }
+
+    /// `true` when every file in `requiredFiles` is present and load-ready
+    /// under `repoPath` — see `incompleteFiles(at:requiredFiles:)`.
+    static func isCacheComplete(at repoPath: URL, requiredFiles: Set<String>) -> Bool {
+        incompleteFiles(at: repoPath, requiredFiles: requiredFiles).isEmpty
+    }
+
+    /// `true` when any `*.partial` staging file from an interrupted
+    /// `FileDownloader` fetch remains under `url`.
+    static func containsPartialDownload(at url: URL) -> Bool {
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: url, includingPropertiesForKeys: nil)
+        else { return false }
+        for case let item as URL in enumerator where item.pathExtension == "partial" {
+            return true
+        }
+        return false
+    }
+
+    /// Files whose on-disk size is smaller than (or missing versus) the
+    /// published remote size, as `"path (local/remote bytes)"`, sorted.
+    ///
+    /// The pure comparison behind `ModelHub.logLoadFailureSizeDiagnosis`:
+    /// a truncated weight file and a full-size model that cannot run on
+    /// this hardware produce the same CoreML "Unable to load model" error
+    /// (issue #819 discussion / #828); byte counts are what separates
+    /// them. `subPath` is stripped from remote paths to form local paths
+    /// under `repoPath`; remote entries with unreported sizes (-1) are
+    /// skipped.
+    static func undersizedFiles(
+        remote: [RemoteFile], at repoPath: URL, subPath: String?
+    ) -> [String] {
+        var short: [String] = []
+        for file in remote where file.size > 0 {
+            var localRel = file.path
+            if let sub = subPath, localRel.hasPrefix("\(sub)/") {
+                localRel = String(localRel.dropFirst(sub.count + 1))
+            }
+            let localPath = repoPath.appendingPathComponent(localRel).path
+            let attributes = try? FileManager.default.attributesOfItem(atPath: localPath)
+            let localSize = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+            if localSize < Int64(file.size) {
+                short.append("\(localRel) (\(localSize)/\(file.size) bytes)")
+            }
+        }
+        return short.sorted()
     }
 
     /// Delete a corrupted repo cache, tolerating an already-missing path

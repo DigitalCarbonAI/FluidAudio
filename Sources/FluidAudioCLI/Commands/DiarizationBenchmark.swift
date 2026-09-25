@@ -115,7 +115,7 @@ enum StreamDiarizationBenchmark {
                 --min-embed-update <sec>    Min segment duration to update embeddings (default: 2.0)
 
             Offline Mode Options:
-                --threshold <0-√2>          Clustering threshold (default: 0.6)
+                --threshold <0-2>           AHC cut distance, higher = fewer speakers (default: 0.6)
                 --fa <float>                VBx warm-start precision (default: 0.07)
                 --fb <float>                VBx warm-start recall (default: 0.8)
                 --window-duration <sec>     Segmentation window size (default: 10.0)
@@ -939,6 +939,18 @@ enum StreamDiarizationBenchmark {
         }
     }
 
+    /// Deterministic winner among per-speaker overlap totals: largest
+    /// overlap, ties broken by smaller speaker id (dictionary iteration
+    /// order is per-instance random; issue #922).
+    static func bestOverlapMatch(
+        _ overlapsBySpeaker: [String: Float]
+    ) -> (speakerId: String, overlap: Float)? {
+        overlapsBySpeaker.max(by: {
+            if $0.value != $1.value { return $0.value < $1.value }
+            return $0.key > $1.key
+        }).map { ($0.key, $0.value) }
+    }
+
     /// Calculate DER metrics with first-occurrence mapping for streaming evaluation
     private static func calculateStreamingMetrics(
         predicted: [TimedSpeakerSegment],
@@ -985,7 +997,7 @@ enum StreamDiarizationBenchmark {
             }
 
             // Find the GT speaker with most overlap
-            if let (bestMatch, bestOverlap) = overlapsByGtSpeaker.max(by: { $0.value < $1.value }),
+            if let (bestMatch, bestOverlap) = bestOverlapMatch(overlapsByGtSpeaker),
                 bestOverlap > 0.5
             {  // Require at least 0.5s total overlap
                 firstOccurrenceMap[predSegment.speakerId] = bestMatch

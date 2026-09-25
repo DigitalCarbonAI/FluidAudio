@@ -114,6 +114,7 @@ internal struct TdtDecoderV3: Sendable {
         globalFrameOffset: Int = 0,
         language: Language? = nil,
         vocabulary: [Int: String]? = nil,
+        punctuationTokenIds: Set<Int>? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
         initialTimeIndexOverride: Int? = nil
     ) async throws -> TdtHypothesis {
@@ -363,7 +364,7 @@ internal struct TdtDecoderV3: Sendable {
                 vocabulary: vocabulary,
                 blankId: blankId
             )
-            if let lang = language, lang.script == .latin, lang != .english,
+            if Self.englishBlocklistApplies(to: language),
                 let ids = decision.topKIds, let logits = decision.topKLogits, let vocab = vocabulary
             {
                 Self.applyEnglishBlocklist(
@@ -464,7 +465,7 @@ internal struct TdtDecoderV3: Sendable {
                     vocabulary: vocabulary,
                     blankId: blankId
                 )
-                if let lang = language, lang.script == .latin, lang != .english,
+                if Self.englishBlocklistApplies(to: language),
                     let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits,
                     let vocab = vocabulary
                 {
@@ -525,6 +526,9 @@ internal struct TdtDecoderV3: Sendable {
                     hypothesis.timestamps.append(emissionTimestamp)
                     hypothesis.tokenConfidences.append(score)
                     hypothesis.tokenDurations.append(duration)
+                } else {
+                    hypothesis.suppressedTokens.append(label)
+                    hypothesis.suppressedTimestamps.append(emissionTimestamp)
                 }
                 hypothesis.lastToken = label  // Remember for next iteration
                 phraseState = selectedPhraseState
@@ -668,6 +672,9 @@ internal struct TdtDecoderV3: Sendable {
                         hypothesis.timestamps.append(finalTimestamp)
                         hypothesis.tokenConfidences.append(score)
                         hypothesis.tokenDurations.append(duration)
+                    } else {
+                        hypothesis.suppressedTokens.append(token)
+                        hypothesis.suppressedTimestamps.append(finalTimestamp)
                     }
                     hypothesis.lastToken = token
                     phraseState = finalPhraseState
@@ -702,10 +709,11 @@ internal struct TdtDecoderV3: Sendable {
         decoderState.phraseBoostingState = phraseBoostingContext == nil ? nil : phraseState
 
         // Clear cached predictor output if ending with punctuation
-        // This prevents punctuation from being duplicated at chunk boundaries
-        if let lastToken = hypothesis.lastToken,
-            ASRConstants.punctuationTokens.contains(lastToken)
-        {
+        // This prevents punctuation from being duplicated at chunk boundaries.
+        // Ids come from the loaded vocabulary (issue #905); the v3 constant is
+        // only the fallback when the caller has none.
+        let punctuation = punctuationTokenIds ?? Set(ASRConstants.punctuationTokens)
+        if let lastToken = hypothesis.lastToken, punctuation.contains(lastToken) {
             decoderState.predictorOutput = nil
             // Keep lastToken for linguistic context - deduplication handles duplicates at higher level
         }
@@ -734,9 +742,17 @@ internal struct TdtDecoderV3: Sendable {
 
     // MARK: - Private Helper Methods
 
-    /// When the target language is a non-English Latin-script language and the
-    /// winning token is in the English-exclusive blocklist, replace it with the
-    /// highest-logit top-K token that is not in the blocklist.
+    /// The blocklist is French-only: its token list was tuned against French
+    /// prose (#630), and the same ids are core vocabulary elsewhere — Dutch
+    /// ' we'/' was', German ' so', Italian ' so' — so running it for every
+    /// non-English Latin language corrupts clean speech (#840).
+    static func englishBlocklistApplies(to language: Language?) -> Bool {
+        language == .french
+    }
+
+    /// When the target language is French and the winning token is in the
+    /// English-exclusive blocklist, replace it with the highest-logit top-K
+    /// token that is not in the blocklist.
     ///
     /// This runs AFTER `tokenLanguageFilter` (which only distinguishes
     /// Latin from Cyrillic and leaves English/French ambiguous). It targets

@@ -47,6 +47,11 @@ When reviewing long-form ASR output, check the transcript for:
 - glued words (two words joined without a space) or hybrid words stitched
   from both windows' segmentation of the same seam word — `"worksks"`,
   `"automoti"`, mid-word punctuation like `"ye,ah"` (issue #683)
+- subword or word order scrambled *across* a seam — subwords of two
+  adjacent words interleaved (`"im Frühjahr"` → `"imüh Frjahr"`), two words
+  swapped (`"Für die"` → `"die Für"`), or a word's own pieces rearranged
+  (`"Punkt"` → `"Pktun"`). Fixed in PR #830 — see "Token Order Is
+  Authoritative" (issue #825)
 - missing clauses or full sentences after a boundary
 - wrong-language insertions in otherwise single-language audio
 - wrong-script bursts on multilingual v3 audio
@@ -66,9 +71,9 @@ phrase at the wrong point.
 
 | Path | Enabled by | Scope | Purpose |
 |---|---|---|---|
-| Default mel-context | `ASRConfig.melChunkContext = true` | Batch TDT long audio | Preserves the existing 80 ms left-context behavior for non-first chunks. |
-| v3 no-mel | `ASRConfig.melChunkContext = false`, CLI `--no-mel-context` | Parakeet TDT v3 batch long audio | Avoids the v3 multilingual drift introduced by prepending mel context at chunk boundaries. |
-| v3 dual-decode arbitration | `melChunkContext = false` plus `ASRConfig.dualDecodeArbitration = true`, CLI `--no-mel-context --dual-decode-arbitration` | Parakeet TDT v3 no-mel batch long audio | Opt-in quality mode for files where one boundary strategy is clearly safer than another. |
+| Mel-context | `ASRConfig.melChunkContext = true`, CLI `--mel-context` (default for non-v3 models) | Batch TDT long audio | Preserves the existing 80 ms left-context behavior for non-first chunks. |
+| v3 no-mel | Default for v3 (`melChunkContext = nil`); explicit via `ASRConfig.melChunkContext = false`, CLI `--no-mel-context` | Parakeet TDT v3 batch long audio | Avoids the v3 multilingual drift introduced by prepending mel context at chunk boundaries (#594), and — via silence-aligned chunk starts — the quiet-speech drops near long mid-file silence runs (#803). |
+| v3 dual-decode arbitration | `ASRConfig.dualDecodeArbitration = true` on the v3 no-mel path, CLI `--dual-decode-arbitration` | Parakeet TDT v3 no-mel batch long audio | Opt-in quality mode for files where one boundary strategy is clearly safer than another. |
 | Parallel chunk workers | `ASRConfig.parallelChunkConcurrency` (default `4`, clamped to `>= 1`) | Stateless chunked batch TDT (all of the above) | Decodes independent chunks concurrently across a worker pool of cloned `AsrManager` instances. |
 | Post-merge repair pass | `ASRConfig.seamGapRepair = true` (default), CLI `--no-seam-gap-repair` | Multi-chunk batch TDT (all of the above) | Re-decodes suspicious inter-token gaps with fresh seam-free windows, splicing recovered tokens in. See "Post-Merge Repair Pass". |
 
@@ -131,7 +136,8 @@ but the two mechanisms behave differently:
   the chunk so the FastConformer encoder's depthwise convolutions have stable
   left context for the first emitted frame. The decoder is told to *skip*
   those leading frames via `contextSamples`; they do not produce tokens.
-  Enabled when `ASRConfig.melChunkContext = true` (the default).
+  Enabled when `ASRConfig.melChunkContext` resolves to `true` (the default
+  for non-v3 models; v3 defaults to the no-mel path).
 - **Warmup prefix** (`warmupPrefixSamples`, 0–7 encoder frames). Real audio
   from before the chunk start, decoded normally from frame 0; emitted tokens
   are suppressed up to the chunk start via `emitTokensAfterFrame`. Used only
@@ -249,6 +255,32 @@ is robust to small per-chunk timestamp jitter. The contiguous-match path
 preserves order strictly; LCS is only entered when adjacent chunks disagree
 enough that a contiguous run would be dishonest.
 
+### Token Order Is Authoritative
+
+Each merge step produces tokens in linear text order (left prefix, spliced
+seam, right suffix), and `convertTokensToText` builds the transcript by
+joining tokens in that array order. The merged order — not the frame
+timestamps — is the source of truth for the text.
+
+Frame timestamps are therefore **clamped monotonic, never sorted**
+(`enforceMonotonicTimestamps`). A timestamp sort is unsafe as a final pass
+because the key is both coarse and non-monotonic across a seam:
+
+- TDT emits several tokens per 80 ms encoder frame, so many tokens share a
+  timestamp; sorting on ties can reorder same-frame subwords.
+- The two overlapping windows number frames from different global offsets
+  (plus mel-context / warmup adjustments), so a token that linearly *follows*
+  another can carry a numerically *smaller* timestamp. Sorting then pulls it
+  ahead, interleaving subwords from the two windows.
+
+Re-sorting the merged stream by timestamp produced the seam scrambles in
+issue #825 (`"im Frühjahr"` → `"imüh Frjahr"`, `"Für die"` → `"die Für"`,
+`"Punkt"` → `"Pktun"`) — it discarded the order the splice logic below had
+carefully constructed. The clamp instead only raises any backward-stepping
+timestamp to the running maximum, leaving token order untouched while keeping
+the sequence non-decreasing for word timing, `collapseSeamWordDuplicates`,
+and the post-merge repair pass (PR #830).
+
 ### Case-Folded Matching and Seam Word Duplicates
 
 A window that begins mid-sentence biases the decoder to capitalize its first
@@ -365,6 +397,135 @@ which only the V3 decoder implements — v3 and tdtJa models get the
 end-aligned window; v2/tdtCtc110m keep the zero-padded layout
 (`supportsSuppressedPrefix`).
 
+## Streaming Windows (issues #855, #897)
+
+`SlidingWindowAsrManager` decodes overlapping windows (`[left 2 s | chunk |
+right 2 s]`, so consecutive windows share 4 s of audio). Every window after
+the first is decoded **from frame 0 on a fresh decoder state**
+(`TdtDecoderState.make`, exactly as the batch chunker does for every chunk)
+with an emission cutoff (`AsrManager.redecodePlan`): tokens for audio the
+previous windows already emitted are suppressed at the source, minus a
+5-frame jitter margin that dedup strips.
+
+The original design entered each non-final window mid-way with the *carried*
+decoder state so the overlap was not re-emitted. That entry is not safe
+anywhere, and the failures are silent:
+
+- **Blank-out after a sentence-final token.** The carried state, having
+  already consumed the overlap, re-walks it and — typically right after a
+  `.` — emits blanks at 0.98 confidence across the rest of the window. On a
+  real recording at a 7 s chunk, window 2 emitted `s.` and then nothing for
+  10 s of clear speech (`can you do me a favor and validate your findings
+  with codex` lost); at 6 s and 8 s different spans of the same clip went
+  missing. The short final flush window showed the same pathology first
+  (#855, PR #861), and the fresh-state re-decode fixed it there (#895);
+  entering *after* the overlap with the carried state instead of re-walking
+  it does not help — the blank-out follows the next `.` just the same.
+- **Re-segmented overlap duplicates.** When the re-walk did not stall, it
+  re-emitted the overlap with a different segmentation that ID-based dedup
+  cannot match (`environment.` → `air environment`), so both survived.
+
+Two rules make the fresh-state re-decode safe:
+
+- **Fresh decoder state.** Re-walking the overlap with the carried state is
+  the failure above; a fresh state has the previous right context plus this
+  window's left context (4 s) to re-establish itself before the cutoff.
+- **Suppression, not dedup, handles the overlap.** A token-dense overlap can
+  exceed dedup's bounded search; suppressing at the source keeps dedup's job
+  to the jitter margin. For that reason the re-decode path also passes dedup a
+  tolerance of twice the jitter margin (10 frames) instead of the legacy 2 s:
+  with 2 s, a word repeated within 2 s of the seam (`the old code and the net
+  new code`) matched its earlier copy and the bounded substring matcher chopped
+  the whole re-decoded prefix.
+
+**Seam reconciliation (#897).** The previous window's last word may be a
+fragment cut by the window edge (`and an` for `and analyzing`), which dedup
+can never repair: the fragment never equals the full word, a re-emitted single
+token is below the substring matcher's two-token minimum, and a punctuation
+token the decoder attaches at its emission start blocks the suffix–prefix
+match. So the cutoff anchors at the previous window's *last word start*
+(`lastWordStartFrame`), the window re-decodes that word in full, and
+`AsrManager.reconcileFinalWindowSeam` retires the previous last word from the
+accumulated tokens and text (`droppedPreviousTokens`) while stripping the
+re-decode's seam artifacts: punctuation emitted at or before that word's
+frame, and tokens duplicating a kept previous token inside the jitter region.
+Clip 03 of the fixtures pins it: `code and an, and analyzing` → `code and
+analyzing`, matching batch.
+
+Two refinements the end-aligned window made necessary: the re-decode can
+re-emit the word *before* the previous last word inside the jitter margin, so
+re-emitted earlier words are consumed as whole words before the retire
+decision; and the re-decode's copy of the last word can drift past the margin
+(`out`@247 re-emitted at 253), so the same-word test compares word starts
+within the duplicate tolerance. A genuine fast repetition inside that
+tolerance (`go go again`) is told apart by evidence: the decoder reports the
+tokens it consumed but suppressed before the cutoff, and when the previous
+word is among them at its own frame, the visible copy is a second word and
+stays. With vocabulary boosting the transcript text may hold a replacement
+for the retired word rather than its raw token text, so the manager tracks
+the rendered form of each window's last word and retires that.
+
+**End-aligned final window.** A short final flush window (a 16.9 s clip at
+an 8 s chunk leaves 0.9 s of new audio behind 2 s of left context) yields
+nothing from a fresh state, dropping the last words — the dominant remaining
+loss on long LibriSpeech files. The final window is therefore end-aligned to
+span a full chunk plus the left context (`finalWindowStart`), the sample
+buffer keeps that much audio behind the next window center, and the re-decode
+cutoff suppresses what previous windows already emitted, as the batch path
+does since #747.
+
+Regression fixtures: `Tests/FluidAudioTests/ASR/Parakeet/SlidingWindow/Fixtures`
+(three real recordings, cleared for release by the speaker), exercised by
+`SlidingWindowFinalWindowRegressionTests` whenever the v3 models are cached.
+
+## Empty-Window Recovery (issue #909)
+
+Parakeet TDT v3 has input cuts on which it emits nothing: the joint predicts
+blank at every frame from a fresh state, for 11–13 s of clear read speech.
+It reproduces in batch on the exact span (`121-123859-0002` 0–13.0 s empty,
+0–12.9 s and 0–14.0 s correct), flips with tenths of a second of length, and
+the fp16 MLX port of the same checkpoint blanks on the same cuts — so this is
+the model, not CoreML quantization. The output is on a knife edge with
+respect to the length inputs: the mel normalization moves by about 1 %
+between a 12 s and a 13 s input, and that is enough to flip the whole
+sequence.
+
+`AsrManager.executeMLInferenceWithTimings` (every decode path: single-shot,
+batch chunks, streaming windows) therefore recovers an empty decode of a
+window that carries speech (≥ 2 s, RMS ≥ −50 dBFS) by re-running with a
+different length declaration, from a copy of the decoder state the first
+attempt started from, and keeps the first non-empty result:
+
+1. `.encoderFull` — `mel_length` set to the padded frame count, so the
+   encoder treats the zero padding as valid audio (the decoder still stops
+   at the real frames);
+2. `.preprocessorFull` — `audio_length` set to the padded length, which
+   also changes the mel normalization;
+3. `.trimmedTail` — the audio declared 0.2 s shorter; the last resort, at
+   the price of the final 0.2 s, which the next window's overlap covers
+   everywhere but at the very end of the stream.
+
+Each policy flips cuts the others do not; the ladder recovers ten of the
+eleven reproduced spans. A good window is never touched: the ladder runs
+only when the first decode produced nothing at all — not even tokens
+suppressed before a streaming re-decode cutoff, which mean the window
+decoded fine and its new audio was silent — at the cost of one extra
+preprocessor + encoder + decoder pass per step. The energy gate is a
+non-silence test, not a speech test, so a recovered hypothesis replaces the
+empty decode only when it is credible (at least two tokens at a mean
+confidence of 0.7; genuine recoveries score about 0.9). Every suspicious
+window gets the whole ladder: a reduced ladder would lose for good a
+one-off cut that only a later policy flips (the next window's overlap
+covers only part of it, and single-shot decoding has no later chance), and
+nothing cheaper than the model itself tells speech from music or noise
+here. Music and noise decode to nothing on every window and pass the
+energy gate, so non-speech audio pays the full ladder per window. Measured
+on 30 s of MUSAN music on an M5 Pro, net of model load: batch 0.0 s → 0.5 s,
+streaming at the default chunk 0.4 s → 1.0 s — still tens of times faster
+than real time.
+The recovery is enabled for `parakeet-tdt-0.6b-v3`, the model it was
+demonstrated on.
+
 ## Post-Merge Repair Pass
 
 Every fix in the earlier sections operates on tokens that *exist* in at
@@ -469,7 +630,12 @@ RMS exceeds `0.008 / 0.3 ≈ 0.027`.
 - Probes are extra window decodes: ~25–30 on a 30-minute applause-heavy
   conference file (~20% over baseline), near zero on clean audio.
 - Seam **garbles** ("language in" → "languag ines") leave no token gap and
-  are invisible to the pass — they need a fix in the merger itself.
+  are invisible to the pass — they need a fix in the merger itself. The
+  *order-inversion* subclass of this (subwords/words reordered across a seam,
+  issue #825) is fixed in the merger by keeping token order authoritative
+  instead of re-sorting by timestamp (PR #830, see "Token Order Is
+  Authoritative"). Garbles from the two windows tokenizing the same audio
+  *differently* at the splice are a separate, still-open case.
 - Edge re-hearings with different tokenization can occasionally duplicate a
   boundary word (~1 per 15–20 min of dense conference speech) — the same
   artifact class and rate the merger already produces. Deliberately not
@@ -479,12 +645,15 @@ RMS exceeds `0.008 / 0.3 ≈ 0.027`.
   with a quiet gap clamps to the ceiling, so that gap is gated as if the
   whole file were loud. A gap-local reference window would close this.
 - The dead-silence-at-window-end pathology also afflicts **mid-file**
-  windows whose fixed-stride end lands inside a silence run (observed: a
-  LibriVox recording whose quiet outro credit falls in such a window loses
-  it — on `main` and on this branch alike). Snapping *every* window end to
-  the last speech-bearing frame was tried and reverted: it perturbs dozens
-  of mid-file windows per hour of audio for a net-neutral WER change. A
-  targeted fix needs its own issue and regression run.
+  windows on the mel-context path (issue #803; observed: a LibriVox
+  recording whose quiet outro credit falls in such a window loses it).
+  Snapping window ends to the last speech-bearing frame was tried twice and
+  reverted both times — the failing window decodes all-blank even when
+  trimmed and backfilled to end in speech, because the trigger is
+  fixed-stride window *starts* landing mid-word on quiet speech, not the
+  trailing silence. The v3 no-mel path's silence-aligned starts avoid the
+  class (validated on the LibriVox case), which is why v3 now defaults to
+  no-mel; the mel-context path retains the limitation.
 - Repair validation corpora are English conference and quiet dictation
   audio; multilingual and music-heavy content is less exercised.
 
@@ -612,6 +781,7 @@ authoritative record; the milestones:
 | 2026-07 (#758 → #761) | Seam-gap repair pass | multi-second speech spans dropped at low-SNR seams — unfixable at the merge layer because the tokens never existed. |
 | 2026-07 (#759) | Bound-safe fallbacks in merge repairs | three residual paths that dropped content when no splice-safe token existed. |
 | 2026-07 (#747) | End-aligned final window + adaptive speech gate | final-window blank-out on quiet audio — a short last chunk zero-padded to the model window is a degenerate input; fixed structurally by backfilling with real audio. The adaptive gate replaced an absolute energy gate that was structurally dead on the quiet-audio class. |
+| 2026-07 (#825 → #830) | Merge order authoritative; clamp timestamps instead of re-sorting | subwords/words reordered across a seam ("im Frühjahr" → "imüh Frjahr", "Für die" → "die Für") — a final global timestamp sort scrambled the order the splice logic had built, because frame timestamps are coarse and don't co-register across a seam. |
 
 Two recurring lessons in that table:
 

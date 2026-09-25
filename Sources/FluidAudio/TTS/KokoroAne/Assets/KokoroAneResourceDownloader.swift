@@ -11,6 +11,16 @@ public enum KokoroAneResourceDownloader {
     /// `<App caches>/fluidaudio/Models/` on iOS.
     public static let modelsSubdirectory = "Models"
 
+    /// Resolve a variant's cache directory without downloading its CoreML
+    /// chain. Auxiliary frontends use this to remain independently lazy.
+    static func repositoryDirectory(
+        variant: KokoroAneVariant,
+        directory: URL? = nil
+    ) throws -> URL {
+        let modelsDirectory = try directory ?? defaultModelsDirectory()
+        return modelsDirectory.appendingPathComponent(variant.repo.folderName)
+    }
+
     /// Ensure all required mlmodelc + vocab + default voice files are present.
     /// Returns the repo directory containing them.
     @discardableResult
@@ -21,17 +31,29 @@ public enum KokoroAneResourceDownloader {
     ) async throws -> URL {
         let modelsDirectory = try directory ?? defaultModelsDirectory()
         let repo = variant.repo
-        let repoDir = modelsDirectory.appendingPathComponent(repo.folderName)
+        let repoDir = try repositoryDirectory(variant: variant, directory: modelsDirectory)
 
         let required: Set<String>
         switch variant {
-        case .english:
+        case .english, .spanish, .french:
             required = ModelNames.KokoroAne.requiredModels
         case .mandarin:
             required = ModelNames.KokoroAne.requiredModelsZh
         case .japanese:
             required = ModelNames.KokoroAne.requiredModelsJa
         }
+
+        // ModelHub deliberately skips existing files. Repair legacy compiled
+        // bundles before the existence-only fast path so caches created before
+        // the flexible-shape models were published do not remain broken on the
+        // OS 27 E5 runtime forever (#738).
+        try await KokoroAneModelCacheMigrationCoordinator.shared.repairIfNeeded(
+            repo: repo,
+            modelsDirectory: modelsDirectory,
+            repoDirectory: repoDir,
+            progressHandler: progressHandler
+        )
+
         let allPresent = required.allSatisfy { name in
             FileManager.default.fileExists(atPath: repoDir.appendingPathComponent(name).path)
         }
@@ -100,6 +122,103 @@ public enum KokoroAneResourceDownloader {
         }
 
         return g2pDir
+    }
+
+    /// Ensure the Japanese frontend assets (trimmed unidic-lite MeCab
+    /// dictionary + Cutlet word list) are resident under `<repoDir>/g2p/`,
+    /// pulled from `FluidInference/kokoro-82m-coreml/ANE-ja/assets/` the way
+    /// the Mandarin tables are. Fetched only when plain Japanese text is
+    /// synthesized; the IPA bypass never needs them. Idempotent.
+    @discardableResult
+    public static func ensureJapaneseG2P(
+        repoDirectory: URL
+    ) async throws -> URL {
+        let g2pDir = repoDirectory.appendingPathComponent(KokoroAneConstants.g2pSubdir)
+        if !FileManager.default.fileExists(atPath: g2pDir.path) {
+            try FileManager.default.createDirectory(at: g2pDir, withIntermediateDirectories: true)
+        }
+        for name in KokoroAneConstants.japaneseG2PFiles {
+            let localURL = g2pDir.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: localURL.path) {
+                do {
+                    try JapaneseMecabDictionary.validateAsset(named: name, at: localURL)
+                    continue
+                } catch {
+                    // A truncated or empty cached file must not make the
+                    // downloader skip the fetch (it keeps existing files).
+                    logger.warning("Cached Japanese G2P asset '\(name)' rejected (\(error)); re-downloading")
+                    try? FileManager.default.removeItem(at: localURL)
+                }
+            }
+            logger.info(
+                "Downloading Japanese G2P asset '\(name)' from "
+                    + "\(KokoroAneConstants.g2pRemoteRepo)/\(KokoroAneConstants.japaneseG2PRemoteSubdir)/...")
+            let remoteURL = try ModelRegistry.resolveModel(
+                KokoroAneConstants.g2pRemoteRepo, "\(KokoroAneConstants.japaneseG2PRemoteSubdir)/\(name)")
+            _ = try await AssetDownloader.ensure(
+                .init(
+                    description: "Japanese G2P asset \(name)",
+                    remoteURL: remoteURL,
+                    destinationURL: localURL,
+                    transferMode: .file()
+                ),
+                logger: logger
+            )
+        }
+        return g2pDir
+    }
+
+    /// Ensure a Kokoro lexicon cache (`us_`/`fr_`/`es_lexicon_cache.json`,
+    /// same `{lower, caseSensitive}` schema) is in the shared kokoro cache
+    /// directory, fetched from the `kokoro-82m-coreml` repo root. Returns the
+    /// local file URL.
+    @discardableResult
+    public static func ensureLexiconCache(
+        _ fileName: String,
+        directory: URL? = nil
+    ) async throws -> URL {
+        let modelsDirectory = try directory ?? defaultModelsDirectory()
+        let kokoroDir = modelsDirectory.appendingPathComponent(Repo.kokoro.folderName)
+        try FileManager.default.createDirectory(at: kokoroDir, withIntermediateDirectories: true)
+        let localURL = kokoroDir.appendingPathComponent(fileName)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            return localURL
+        }
+        let remoteURL = try ModelRegistry.resolveModel(Repo.kokoro.remotePath, fileName)
+        _ = try await AssetDownloader.ensure(
+            .init(description: fileName, remoteURL: remoteURL, destinationURL: localURL),
+            logger: logger)
+        return localURL
+    }
+
+    /// Files a compiled `.mlmodelc` bundle needs to load.
+    static let compiledBundleFiles = [
+        "coremldata.bin", "model.mil", "metadata.json", "weights/weight.bin", "analytics/coremldata.bin",
+    ]
+
+    /// Ensure the CharsiuG2P CoreML pair (`MultilingualG2PEncoder.mlmodelc`,
+    /// `MultilingualG2PDecoder.mlmodelc`) is in the shared kokoro cache
+    /// directory, where ``MultilingualG2PModel`` loads it from. The French
+    /// frontend uses it for words missing from the lexicon.
+    public static func ensureMultilingualG2PAssets(
+        directory: URL? = nil,
+        progressHandler: ProgressHandler? = nil
+    ) async throws {
+        let modelsDirectory = try directory ?? defaultModelsDirectory()
+        let kokoroDir = modelsDirectory.appendingPathComponent(Repo.kokoro.folderName)
+        for bundle in ModelNames.MultilingualG2P.requiredModels.sorted() {
+            let bundleDir = kokoroDir.appendingPathComponent(bundle)
+            // Every file of the compiled bundle, not just the weights: files
+            // download in parallel, so an interrupted first fetch can leave
+            // weight.bin without model.mil. ModelHub skips files already present.
+            let complete = compiledBundleFiles.allSatisfy {
+                FileManager.default.fileExists(atPath: bundleDir.appendingPathComponent($0).path)
+            }
+            if complete { continue }
+            logger.info("Downloading \(bundle) from HuggingFace...")
+            try await ModelHub.download(
+                .kokoro, subdirectory: bundle, to: kokoroDir, progressHandler: progressHandler)
+        }
     }
 
     /// Best-effort fetch of the jieba HMM tables (start / trans / emit)
@@ -321,9 +440,13 @@ public enum KokoroAneResourceDownloader {
     /// Default voice for each variant is included in `requiredModels(Zh)`; this
     /// helper covers any additional voice that ships separately.
     ///
-    /// Mandarin (`ANE-zh/`) voice packs live under a `voices/` subdirectory,
-    /// both remotely and on disk. English (`ANE/`) voice packs sit at the
-    /// bundle root.
+    /// Mandarin (`ANE-zh/`) and Japanese voice packs live under a `voices/`
+    /// subdirectory, both remotely and on disk. English (`ANE/`) voice packs
+    /// sit at the bundle root, and only `af_heart.bin` is published there:
+    /// any other English voice is fetched from the repo-root
+    /// `voices/<name>.json` (the Kokoro-82M v1.0 set, see
+    /// `KokoroAneConstants.englishVoices`) and converted on first use (#896).
+    /// Throws `KokoroAneError.voiceNotFound` with the known list otherwise.
     @discardableResult
     public static func ensureVoicePack(
         _ voice: String,
@@ -358,15 +481,42 @@ public enum KokoroAneResourceDownloader {
         } else {
             remoteFilePath = relativePath
         }
-        let remoteURL = try ModelRegistry.resolveModel(repo.remotePath, remoteFilePath)
-        let data = try await AssetDownloader.fetchData(
-            from: remoteURL,
-            description: "\(sanitized) voice pack",
-            logger: logger
-        )
-        try data.write(to: localURL, options: [.atomic])
-        logger.info("Downloaded voice pack '\(sanitized)' (\(data.count / 1024) KB)")
-        return localURL
+        let expectedBytes =
+            KokoroAneConstants.voicePackRows * KokoroAneConstants.voicePackCols
+            * MemoryLayout<Float>.size
+
+        // 1. The variant bundle's own pre-converted `.bin` (Mandarin/Japanese
+        //    ship every voice this way; English ships only `af_heart`).
+        if let remoteURL = try? ModelRegistry.resolveModel(repo.remotePath, remoteFilePath),
+            let data = try? await AssetDownloader.fetchData(
+                from: remoteURL, description: "\(sanitized) voice pack", logger: logger),
+            data.count == expectedBytes
+        {
+            try data.write(to: localURL, options: [.atomic])
+            logger.info("Downloaded voice pack '\(sanitized)' (\(data.count / 1024) KB)")
+            return localURL
+        }
+
+        // 2. `ANE/` variants (English, Spanish, French): the Kokoro-82M v1.0
+        //    pack hosted as `voices/<name>.json` at the repository root,
+        //    converted to the flat fp32 layout (#896). The chain takes style
+        //    vectors as runtime inputs, so this is the same data `af_heart.bin`
+        //    carries, byte-exact after conversion.
+        if variant.repo == .kokoroAne,
+            let jsonURL = try? ModelRegistry.resolveModel(repo.remotePath, "voices/\(sanitized).json"),
+            let json = try? await AssetDownloader.fetchData(
+                from: jsonURL, description: "\(sanitized) voice pack (json)", logger: logger),
+            let pack = try? KokoroAneVoicePack.load(fromJSON: json)
+        {
+            try pack.binaryData.write(to: localURL, options: [.atomic])
+            logger.info(
+                "Converted voice pack '\(sanitized)' from voices/\(sanitized).json (\(json.count / 1024) KB → \(expectedBytes / 1024) KB)"
+            )
+            return localURL
+        }
+
+        throw KokoroAneError.voiceNotFound(
+            voice: voice, variant: variant, available: variant.knownVoices)
     }
 
     // MARK: - Private

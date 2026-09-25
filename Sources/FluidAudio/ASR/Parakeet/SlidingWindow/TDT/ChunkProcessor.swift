@@ -51,7 +51,7 @@ struct ChunkProcessor {
     }
 
     private func effectiveWarmupPrefixSamples(melChunkContext: Bool, modelVersion: AsrModelVersion?) -> Int {
-        guard !melChunkContext, case .v3? = modelVersion else { return 0 }
+        guard !melChunkContext, modelVersion?.isV3Family == true else { return 0 }
         return noMelWarmupPrefixSamples
     }
 
@@ -133,7 +133,7 @@ struct ChunkProcessor {
     /// prefix twice. V2-family models keep the zero-padded final window.
     static func supportsSuppressedPrefix(_ version: AsrModelVersion?) -> Bool {
         switch version {
-        case .v3, .tdtJa: return true
+        case .v3, .redux, .ultra, .tdtJa: return true
         default: return false
         }
     }
@@ -428,7 +428,7 @@ struct ChunkProcessor {
             warmupPrefixSamples: layout.warmupPrefixSamples,
             chunkSamples: layout.chunkSamples,
             strideSamples: layout.strideSamples,
-            preferSilenceAlignment: !melChunkContext && modelVersion == .v3
+            preferSilenceAlignment: !melChunkContext && modelVersion?.isV3Family == true
         ).map { ($0.start, $0.useWarmupPrefix) }
     }
 
@@ -472,7 +472,7 @@ struct ChunkProcessor {
 
         // Dual-decode opt-in (only effective for v3 + no-mel; other paths
         // are not changed by the flag).
-        if dualDecodeArbitration, !melChunkContext, modelVersion == .v3 {
+        if dualDecodeArbitration, !melChunkContext, modelVersion?.isV3Family == true {
             return try await processWithDualDecodeArbitration(
                 using: manager,
                 workers: workers,
@@ -494,7 +494,7 @@ struct ChunkProcessor {
             warmupPrefixSamples: warmupPrefixSamples,
             chunkSamples: chunkSamples,
             strideSamples: strideSamples,
-            preferSilenceAlignment: !melChunkContext && modelVersion == .v3
+            preferSilenceAlignment: !melChunkContext && modelVersion?.isV3Family == true
         )
 
         var chunkOutputs: [TaskResult?] = []
@@ -689,12 +689,22 @@ struct ChunkProcessor {
                     caseVariantIds: caseVariantIds
                 )
             }
-            if mergedTokens.count > 1 {
-                mergedTokens.sort { $0.timestamp < $1.timestamp }
-            }
+            // The pairwise merges above already yield tokens in linear (text)
+            // order. Do NOT re-sort by timestamp: frame timestamps are coarse
+            // (TDT emits several tokens per 80 ms frame, so many are equal) and
+            // the two overlapping windows' frame indices don't co-register
+            // across a seam, so a timestamp sort reorders same-frame subwords
+            // and interleaves subwords from the two windows — the token-order
+            // inversion in issue #825 ("Für die" -> "die Für", "im Frühjahr"
+            // -> "imüh Frjahr", "Punkt" -> "Pktun"). Preserve the merge order
+            // and only clamp timestamps to be non-decreasing so downstream word
+            // timing and the seam-gap repair pass stay monotonic.
+            mergedTokens = Self.enforceMonotonicTimestamps(mergedTokens)
             mergedTokens = collapseSeamWordDuplicates(mergedTokens, vocabulary: vocabulary)
-        } else if mergedTokens.count > 1 {
-            mergedTokens.sort { $0.timestamp < $1.timestamp }
+        } else {
+            // Single window: tokens are already emitted in time order; clamp is
+            // a no-op but keeps the invariant explicit.
+            mergedTokens = Self.enforceMonotonicTimestamps(mergedTokens)
         }
 
         // Post-merge repair pass re-decodes seam gaps the merger dropped
@@ -853,6 +863,28 @@ struct ChunkProcessor {
     /// left by a false sentence start, at word granularity (issue #706) — see
     /// "Case-Folded Matching" in Documentation/ASR/LongTranscription.md for
     /// the collapse conditions and what is deliberately left alone.
+    /// Make token timestamps non-decreasing *without reordering* the stream.
+    /// The merged token order is the source of truth for the transcript text
+    /// (`convertTokensToText` joins tokens in array order); frame timestamps
+    /// are metadata that can be locally out of order across a chunk seam.
+    /// Each token that would step backwards in time is clamped up to the
+    /// running maximum, so word timing and the seam-gap repair pass see a
+    /// monotonic sequence while the text order the merger produced is kept
+    /// intact (issue #825).
+    static func enforceMonotonicTimestamps(_ tokens: [TokenWindow]) -> [TokenWindow] {
+        guard tokens.count > 1 else { return tokens }
+        var result = tokens
+        var lastTimestamp = result[0].timestamp
+        for index in 1..<result.count {
+            if result[index].timestamp < lastTimestamp {
+                result[index].timestamp = lastTimestamp
+            } else {
+                lastTimestamp = result[index].timestamp
+            }
+        }
+        return result
+    }
+
     func collapseSeamWordDuplicates(
         _ tokens: [TokenWindow],
         vocabulary: [Int: String]

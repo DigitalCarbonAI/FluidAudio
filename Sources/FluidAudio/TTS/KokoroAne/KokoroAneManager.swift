@@ -16,8 +16,8 @@ import Foundation
 ///     Mandarin); additional voices download on demand via ``setDefaultVoice``
 ///     / `voice:` / `initialize(preloadVoices:)`.
 ///   * IPA input capped at 512 tokens — chunk longer prompts upstream.
-///   * Loads from HF path `kokoro-82m-coreml/ANE/` (English) or
-///     `ANE-zh/` (Mandarin).
+///   * Loads from HF path `kokoro-82m-coreml/ANE/` (English, Spanish,
+///     French), `ANE-zh/` (Mandarin) or `ANE-ja/` (Japanese).
 ///
 /// Pipeline:
 ///   * Text → IPA via ``KokoroAneEnglishPhonemizer`` (Misaki lexicon first
@@ -66,6 +66,9 @@ public actor KokoroAneManager {
     /// Download (if missing), load all 7 mlmodelcs + vocab + default voice
     /// pack. Optionally pre-warm additional voice packs.
     public func initialize(preloadVoices: Set<String>? = nil) async throws {
+        if let advisory = Self.osAdvisory(for: ProcessInfo.processInfo.operatingSystemVersion) {
+            logger.warning(advisory)
+        }
         try await store.loadIfNeeded()
         // English G2P CoreML assets live in the kokoro repo and are loaded
         // from ~/.cache/fluidaudio/Models/kokoro/. The Mandarin variant
@@ -93,11 +96,68 @@ public actor KokoroAneManager {
             // to the BART-G2P-only path rather than failing initialize.
             _ = await KokoroAneResourceDownloader.ensureEnglishLexicon(directory: nil)
         }
+        switch variant {
+        case .french:
+            // Lexicon + CharsiuG2P fallback, fetched up front so the first
+            // synthesis does not stall on (or fail without) the network.
+            _ = try await store.frenchG2PPipeline()
+            try await KokoroAneResourceDownloader.ensureMultilingualG2PAssets(directory: nil)
+        case .spanish:
+            _ = await store.spanishLexicon()
+        case .english, .mandarin, .japanese:
+            break
+        }
         if let voices = preloadVoices {
             for voice in voices {
                 _ = try await store.voicePack(voice)
             }
         }
+    }
+
+    #if os(macOS)
+    private static let runningOnMacOS = true
+    #else
+    private static let runningOnMacOS = false
+    #endif
+
+    /// The 26.4+ OS line carries an Apple BNNS bug that can intermittently
+    /// crash synthesis in libBNNS on any compute-unit routing
+    /// (#328/#587/#667/#817). macOS 26.6 fixes it (verified, #817); iOS 26.6
+    /// still crashes with the identical signature (#844), and iOS 27.0 crashes
+    /// in libBNNS (`vadd_fp16_sme_internal`) on the Metal-free route that is
+    /// the 27 default, while the Metal route aborts in MPSGraph (#843, #889).
+    /// So on non-macOS everything from 26.4 on stays flagged until a build is
+    /// shown to be safe. macOS 27 has no report and is not flagged.
+    static func isBnnsCrashProneOS(
+        _ version: OperatingSystemVersion, onMacOS: Bool = runningOnMacOS
+    ) -> Bool {
+        if version.majorVersion >= 27 { return !onMacOS }
+        guard version.majorVersion == 26, version.minorVersion >= 4 else { return false }
+        return onMacOS ? version.minorVersion <= 5 : true
+    }
+
+    /// The warning `initialize()` logs on a crash-prone OS build, or nil.
+    /// Route-aware: on the iOS 27 line neither Core ML route is known to be
+    /// safe (#889), which is a different message from the 26.x BNNS bug.
+    static func osAdvisory(
+        for version: OperatingSystemVersion, onMacOS: Bool = runningOnMacOS
+    ) -> String? {
+        guard isBnnsCrashProneOS(version, onMacOS: onMacOS) else { return nil }
+        if version.majorVersion >= 27 {
+            return
+                "iOS/iPadOS 27: no Core ML route for Kokoro ANE is known to be safe. "
+                + "The default Metal-free route (noise + tail on CPU) has crashed in libBNNS "
+                + "(vadd_fp16_sme_internal SIGSEGV) after ~1 h of synthesis, and the Metal "
+                + "route aborts in MPSGraph within minutes. Both are uncatchable in-process. "
+                + "Consider disabling Kokoro ANE on this OS line until a safe route is shown. "
+                + "See https://github.com/FluidInference/FluidAudio/issues/889"
+        }
+        return
+            "This OS build has a known Apple BNNS bug that can "
+            + "intermittently crash Kokoro synthesis (EXC_BAD_ACCESS in libBNNS) "
+            + "regardless of compute-unit routing. macOS 26.6 fixes it; on iOS "
+            + "the 26.6 line still crashes. "
+            + "See https://github.com/FluidInference/FluidAudio/issues/844"
     }
 
     /// `true` once the 7 mlmodelcs + vocab are resident.
@@ -175,8 +235,9 @@ public actor KokoroAneManager {
         voice: String? = nil,
         speed: Float = KokoroAneConstants.defaultSpeed
     ) async throws -> KokoroAneSynthesisResult {
-        let resolved = try await phonemes(for: text)
-        return try await runChain(phonemes: resolved, voice: voice, speed: speed)
+        let frontend = try await resolveFrontend(for: text)
+        return try await runChain(
+            phonemes: frontend.phonemes, normalizedText: frontend.normalizedText, voice: voice, speed: speed)
     }
 
     /// Resolve the exact phoneme string ``synthesize(text:voice:speed:)``
@@ -185,41 +246,90 @@ public actor KokoroAneManager {
     ///
     /// English: Misaki-lexicon-first with BART G2P fallback. Mandarin:
     /// the ``MandarinG2P`` pipeline for Hanzi input, pass-through for
-    /// strings that already look like phonemes. Japanese: no text frontend
-    /// — throws (use ``synthesizeFromPhonemes(_:voice:speed:)`` with
-    /// pre-computed IPA, issue #698).
+    /// strings that already look like phonemes. Japanese: half-width kana
+    /// and range-tilde folding, NeMo written-form normalization, then the
+    /// in-process Cutlet port (MeCab over unidic-lite + Cutlet rules, the
+    /// Kokoro training frontend). A string made only of phoneme-alphabet
+    /// scalars is treated as pre-computed IPA and passed through (issue
+    /// #698); digits, kana and kanji always go through the frontend.
+    /// Spanish: NeMo normalization, then ``SpanishG2P`` spelling rules with
+    /// the `es_lexicon_cache.json` exceptions. French: NeMo normalization,
+    /// then `fr_lexicon_cache.json` with a CharsiuG2P fallback (``FrenchG2P``). Both emit espeak-ng-style IPA;
+    /// pre-computed IPA goes through ``synthesizeFromPhonemes(_:voice:speed:)``.
     public func phonemes(for text: String) async throws -> String {
+        try await resolveFrontend(for: text).phonemes
+    }
+
+    /// Text normalization + G2P, returning both halves so
+    /// ``synthesizeDetailed(text:voice:speed:)`` can report the normalized
+    /// text it actually spoke (issue #943). `normalizedText` is `nil` when the
+    /// input was treated as pre-computed phonemes.
+    func resolveFrontend(for text: String) async throws -> (normalizedText: String?, phonemes: String) {
         switch variant {
         case .english:
             // Byte-exact NeMo TN before G2P via the shared frontend entry
             // point: "$5" → "five dollars", "2024" → "twenty twenty four".
             // No-op for plain prose.
             let normalized = EnglishTextNormalizer.normalizeForFrontend(text)
-            return try await phonemize(text: normalized)
+            return (normalized, try await phonemize(text: normalized))
         case .mandarin:
             try await store.loadIfNeeded()
             // Normalize written forms to their Mandarin reading before
             // segmentation — e.g. "$5" → "五美元", "2024年" → "二零二四年" —
             // so the numeric/semiotic tokens reach MandarinG2P as Hanzi.
-            let normalized = NemoTextNormalizer.normalize(text, language: .mandarin)
+            var normalized = NemoTextNormalizer.normalize(text, language: .mandarin)
+            // Without the engine linked (`NemoTextProcessing` trait off), a
+            // numeric-only input ("$5.50", "99%") has no Hanzi and would fall
+            // into the bopomofo passthrough below, reading digits as tones.
+            // MandarinNumberNormalizer covers those forms so the gate sees Hanzi.
+            if !NemoTextNormalizer.isAvailable, !MandarinG2P.looksLikeHanzi(normalized) {
+                normalized = MandarinNumberNormalizer.normalize(normalized)
+            }
             if MandarinG2P.looksLikeHanzi(normalized) {
                 let g2p = try await store.mandarinG2PPipeline()
-                return try await g2p.phonemize(normalized)
+                return (normalized, try await g2p.phonemize(normalized))
             } else {
                 // No Hanzi present → caller already supplied bopomofo /
                 // ASCII punctuation. Pass through so power users can
                 // still override pronunciation manually.
-                return normalized
+                return (nil, normalized)
             }
         case .japanese:
-            // The Japanese variant ships no in-process kana/kanji → IPA
-            // frontend. Text synthesis isn't supported; callers feed
-            // pre-computed IPA via synthesizeFromPhonemes(_:voice:speed:),
-            // which bypasses phonemes(for:) entirely.
-            throw KokoroAneError.inputProcessingFailed(
-                "Japanese variant has no text G2P frontend; call "
-                    + "synthesizeFromPhonemes(_:voice:speed:) with pre-computed IPA (see #698).")
+            // Pre-computed IPA (issue #698) passes through untouched: NFKC
+            // would fold its modifier letters (ʲ → j). Anything outside the
+            // phoneme alphabet — kana, kanji, half-width kana, digits — is
+            // text and goes through normalization and the frontend.
+            guard !Self.looksLikePrecomputedJapaneseIPA(text) else { return (nil, text) }
+            // The NeMo FST drops half-width dakuten (ｶﾞ → カ) and reads the
+            // full-width tilde as a symbol, so fold both before it runs.
+            let folded = JapaneseCutlet.foldingHalfWidthForms(text)
+            let normalized = NemoTextNormalizer.normalize(folded, language: .japanese)
+            let g2p = try await store.japaneseG2PPipeline()
+            return (normalized, try await g2p.phonemize(normalized))
+        case .spanish:
+            var normalized = NemoTextNormalizer.normalize(text, language: .spanish)
+            // Without the engine linked, read numbers here rather than let the
+            // tokenizer drop them.
+            if !NemoTextNormalizer.isAvailable {
+                normalized = RomanceNumberNormalizer.normalize(normalized, language: .spanish)
+            }
+            let lexicon = await store.spanishLexicon()
+            return (normalized, try Self.nonEmpty(SpanishG2P.phonemize(normalized, lexicon: lexicon), for: text))
+        case .french:
+            var normalized = NemoTextNormalizer.normalize(text, language: .french)
+            if !NemoTextNormalizer.isAvailable {
+                normalized = RomanceNumberNormalizer.normalize(normalized, language: .french)
+            }
+            let g2p = try await store.frenchG2PPipeline()
+            return (normalized, try Self.nonEmpty(await g2p.phonemize(normalized), for: text))
         }
+    }
+
+    private static func nonEmpty(_ phonemes: String, for text: String) throws -> String {
+        guard phonemes.contains(where: { $0.isLetter }) else {
+            throw KokoroAneError.inputProcessingFailed("G2P produced no phonemes for '\(text)'.")
+        }
+        return phonemes
     }
 
     /// Bypass G2P; feed an already-IPA phoneme string directly.
@@ -232,7 +342,7 @@ public actor KokoroAneManager {
         voice: String? = nil,
         speed: Float = KokoroAneConstants.defaultSpeed
     ) async throws -> Data {
-        let result = try await runChain(phonemes: phonemes, voice: voice, speed: speed)
+        let result = try await runChain(phonemes: phonemes, normalizedText: nil, voice: voice, speed: speed)
         return try wavData(from: result)
     }
 
@@ -242,13 +352,14 @@ public actor KokoroAneManager {
         voice: String? = nil,
         speed: Float = KokoroAneConstants.defaultSpeed
     ) async throws -> KokoroAneSynthesisResult {
-        try await runChain(phonemes: phonemes, voice: voice, speed: speed)
+        try await runChain(phonemes: phonemes, normalizedText: nil, voice: voice, speed: speed)
     }
 
     // MARK: - Private
 
     private func runChain(
         phonemes: String,
+        normalizedText: String?,
         voice: String?,
         speed: Float
     ) async throws -> KokoroAneSynthesisResult {
@@ -259,17 +370,20 @@ public actor KokoroAneManager {
 
         let inputIds = try vocab.encode(phonemes)
         // Voice pack indexing matches `convert.py:get_ref_data` — row is the
-        // raw phoneme-string length (BOS/EOS not counted).
-        let phonemeCount = phonemes.count
+        // raw phoneme-string length in scalars (BOS/EOS not counted).
+        let phonemeCount = KokoroAneVocab.phonemeLength(phonemes)
         let (styleS, styleTimbre) = pack.slice(for: phonemeCount)
 
-        return try await KokoroAneSynthesizer.synthesize(
+        var result = try await KokoroAneSynthesizer.synthesize(
             inputIds: inputIds,
             styleS: styleS,
             styleTimbre: styleTimbre,
             speed: speed,
             store: store
         )
+        result.normalizedText = normalizedText
+        result.phonemes = phonemes
+        return result
     }
 
     /// English text → Misaki-style IPA. Lexicon-first resolution (weak
@@ -332,16 +446,38 @@ public actor KokoroAneManager {
 
     private func wavData(from result: KokoroAneSynthesisResult) throws -> Data {
         do {
-            // Japanese writes at the model's native level (no peak-normalization)
-            // so the output matches the PyTorch reference instead of being
-            // slammed to 0 dBFS. English/Mandarin keep peak-normalization until
-            // their tails get the same COLA-corrected iSTFT (#698 follow-up).
+            // All variants write at the model's native level (no
+            // peak-normalization) so the output matches the PyTorch reference
+            // instead of being slammed to 0 dBFS. Requires the COLA-corrected
+            // KokoroTail_v2 (#852).
             return try AudioWAV.data(
                 from: result.samples,
                 sampleRate: Double(result.sampleRate),
-                normalize: variant != .japanese)
+                normalize: false)
         } catch {
             throw KokoroAneError.audioConversionFailed(error.localizedDescription)
         }
+    }
+
+    /// Every scalar is one Kokoro's Japanese phoneme strings can contain:
+    /// ASCII letters, punctuation and space, IPA and modifier letters,
+    /// combining marks, and the quotes/dashes the frontend emits. Digits,
+    /// kana (full- or half-width) and kanji are text, not phonemes.
+    static func looksLikePrecomputedJapaneseIPA(_ text: String) -> Bool {
+        !text.isEmpty
+            && text.unicodeScalars.allSatisfy { scalar in
+                switch scalar.value {
+                case 0x20, 0x21...0x2F, 0x3A...0x40, 0x5B...0x60, 0x7B...0x7E: return true  // ASCII punctuation, space
+                case 0x41...0x5A, 0x61...0x7A: return true  // ASCII letters
+                case 0x00C0...0x024F: return true  // Latin-1 / Extended-A/B (ɡ ǀ ß …)
+                case 0x0250...0x02AF: return true  // IPA extensions
+                case 0x02B0...0x02FF: return true  // spacing modifier letters (ʲ ʰ ː)
+                case 0x0300...0x036F: return true  // combining diacritics
+                case 0x0370...0x03FF: return true  // Greek (β)
+                case 0x1D00...0x1DBF: return true  // phonetic extensions (ᵝ)
+                case 0x2010...0x2027, 0x2039...0x203A, 0x00AB, 0x00BB: return true  // dashes, quotes, ellipsis
+                default: return false
+                }
+            }
     }
 }

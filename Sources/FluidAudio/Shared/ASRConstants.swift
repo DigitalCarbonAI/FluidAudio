@@ -36,8 +36,37 @@ public enum ASRConstants {
     /// WER threshold for detailed error analysis in benchmarks
     public static let highWERThreshold: Double = 0.15
 
-    /// Punctuation token IDs (period, question mark, exclamation mark)
-    public static let punctuationTokens: [Int] = [7883, 7952, 7948]
+    /// Sentence-final punctuation token IDs (`.` `?` `!`) in the
+    /// parakeet-tdt-0.6b-v3 vocabulary. Every other shipped vocabulary uses
+    /// different ids (v2: 841/854/885, 110m: 986/1002/1016), so runtime code
+    /// resolves the set from the loaded vocabulary via
+    /// ``punctuationTokenIds(in:)`` and only falls back to this when no
+    /// vocabulary is available. See issue #905.
+    public static let punctuationTokens: [Int] = [7883, 7956, 8020]
+
+    /// Sentence-final punctuation pieces resolved by text: ASCII `.` `?` `!`
+    /// plus the ideographic full stop and full-width marks the Japanese
+    /// vocabulary uses (`。` is token 1 there; `?` `!` stay ASCII in it).
+    public static let sentenceFinalPunctuation: Set<String> = [".", "?", "!", "。", "？", "！"]
+
+    /// Resolve the sentence-final punctuation token ids (`.` `?` `!`) from a
+    /// loaded vocabulary. A piece matches with or without a leading word
+    /// boundary (`▁` or the space it is normalized to).
+    public static func punctuationTokenIds(in vocabulary: [Int: String]) -> Set<Int> {
+        var ids: Set<Int> = []
+        for (id, piece) in vocabulary {
+            var core = Substring(piece)
+            if core.hasPrefix(sentencePieceWordBoundary) {
+                core = core.dropFirst(sentencePieceWordBoundary.count)
+            } else if core.hasPrefix(" ") {
+                core = core.dropFirst()
+            }
+            if sentenceFinalPunctuation.contains(String(core)) {
+                ids.insert(id)
+            }
+        }
+        return ids
+    }
 
     /// SentencePiece word-boundary marker (U+2581 LOWER ONE EIGHTH BLOCK).
     /// Prefixes tokens that begin a new word in BPE/Unigram tokenization.
@@ -47,6 +76,17 @@ public enum ASRConstants {
 
     /// Standard overlap in encoder frames (2.0s = 25 frames at 0.08s per frame)
     public static let standardOverlapFrames: Int = 25
+
+    /// Maximum global-frame gap between two token occurrences for them to be
+    /// treated as the *same* acoustic event during sliding-window token dedup.
+    ///
+    /// A genuine chunk-boundary duplicate lands at nearly identical global audio
+    /// time in both overlapping windows (difference ~0, plus a few frames of
+    /// cross-window emission jitter). A coincidental subword-prefix match between
+    /// two *different* words spoken seconds apart is far outside this bound, so
+    /// gating on it prevents false-positive dedup that drops real tokens.
+    /// See issue #787.
+    public static let duplicateFrameTolerance: Int = standardOverlapFrames  // 25 frames = 2.0s
 
     /// Minimum confidence score (for empty or very uncertain transcriptions)
     public static let minConfidence: Float = 0.1

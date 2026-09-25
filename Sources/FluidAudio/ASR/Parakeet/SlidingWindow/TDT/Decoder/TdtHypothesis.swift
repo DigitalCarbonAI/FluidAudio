@@ -9,6 +9,12 @@ struct TdtHypothesis {
     var tokenConfidences: [Float] = []
     var phraseBoostingFailureReason: PhraseBoostingFailureReason?
     var phraseBoostingFailed: Bool { phraseBoostingFailureReason != nil }
+    /// Tokens the decoder consumed but did not emit because they fell before
+    /// the caller's emission cutoff (a window re-decode of audio previous
+    /// windows already covered), with their global frames. Seam reconciliation
+    /// reads them as evidence of what the re-decode saw (#897).
+    var suppressedTokens: [Int] = []
+    var suppressedTimestamps: [Int] = []
     /// Last non-blank token decoded in this hypothesis.
     /// Used to initialize the decoder for the next chunk, maintaining context across chunk boundaries.
     var lastToken: Int?

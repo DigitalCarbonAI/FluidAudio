@@ -20,7 +20,10 @@ internal struct TdtDecoderV2 {
         decoderState: inout TdtDecoderState,
         contextFrameAdjustment: Int = 0,
         isLastChunk: Bool = false,
-        globalFrameOffset: Int = 0
+        globalFrameOffset: Int = 0,
+        punctuationTokenIds: Set<Int>? = nil,
+        emitTokensAfterGlobalFrame: Int? = nil,
+        initialTimeIndexOverride: Int? = nil
     ) async throws -> TdtHypothesis {
         let decoder = TdtDecoderV3(config: config)
         return try await decoder.decodeWithTimings(
@@ -34,7 +37,10 @@ internal struct TdtDecoderV2 {
             decoderState: &decoderState,
             contextFrameAdjustment: contextFrameAdjustment,
             isLastChunk: isLastChunk,
-            globalFrameOffset: globalFrameOffset
+            globalFrameOffset: globalFrameOffset,
+            punctuationTokenIds: punctuationTokenIds,
+            emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+            initialTimeIndexOverride: initialTimeIndexOverride
         )
     }
 
@@ -77,7 +83,7 @@ internal struct TdtDecoderV2 {
             parallelChunkConcurrency: config.parallelChunkConcurrency,
             streamingEnabled: config.streamingEnabled,
             streamingThreshold: config.streamingThreshold,
-            melChunkContext: config.melChunkContext,
+            melChunkContext: config.melChunkContextOverride,
             dualDecodeArbitration: config.dualDecodeArbitration
         )
     }

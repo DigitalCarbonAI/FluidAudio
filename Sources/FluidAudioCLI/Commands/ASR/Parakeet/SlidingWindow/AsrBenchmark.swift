@@ -653,7 +653,7 @@ extension ASRBenchmark {
         var useStreamingEou = false
         var longAudioOnly = false
         var modelVersion: AsrModelVersion = .v3  // Default to v3
-        var melChunkContext = true  // Issue #594: opt-out of PR #264's 80ms mel-context prepend
+        var melChunkContext: Bool?  // nil = auto (disabled on v3); see ASRConfig.melChunkContext
         var encoderComputeUnits: MLComputeUnits?  // nil = library default (ANE); see --encoder-compute-units
 
         // Check for help flag first
@@ -715,17 +715,24 @@ extension ASRBenchmark {
                         modelVersion = .v2
                     case "v3", "3":
                         modelVersion = .v3
+                    case "redux":
+                        modelVersion = .redux
+                    case "ultra":
+                        modelVersion = .ultra
                     case "tdt-ctc-110m", "110m":
                         modelVersion = .tdtCtc110m
                     default:
                         logger.error(
-                            "Invalid model version: \(arguments[i + 1]). Use 'v2', 'v3', or 'tdt-ctc-110m'")
+                            "Invalid model version: \(arguments[i + 1]). Use 'v2', 'v3', 'redux', 'ultra', or 'tdt-ctc-110m'"
+                        )
                         exit(1)
                     }
                     i += 1
                 }
             case "--no-mel-context":
                 melChunkContext = false
+            case "--mel-context":
+                melChunkContext = true
             case "--encoder-compute-units":
                 if i + 1 < arguments.count {
                     switch arguments[i + 1].lowercased() {
@@ -761,6 +768,8 @@ extension ASRBenchmark {
         switch modelVersion {
         case .v2: versionLabel = "v2"
         case .v3: versionLabel = "v3"
+        case .redux: versionLabel = "redux"
+        case .ultra: versionLabel = "ultra"
         case .tdtCtc110m: versionLabel = "tdt-ctc-110m"
         case .tdtJa: versionLabel = "tdt-ja"
         }
@@ -769,7 +778,8 @@ extension ASRBenchmark {
         logger.info("   Auto-download: \(autoDownload ? "enabled" : "disabled")")
         logger.info("   Test streaming: \(testStreaming ? "enabled" : "disabled")")
         logger.info("   Streaming EOU: \(useStreamingEou ? "enabled" : "disabled")")
-        logger.info("   Mel chunk context (PR #264): \(melChunkContext ? "enabled" : "disabled")")
+        logger.info(
+            "   Mel chunk context (PR #264): \(melChunkContext.map { $0 ? "enabled" : "disabled" } ?? "auto")")
         if testStreaming {
             logger.info("   Chunk duration: \(streamingChunkDuration)s")
         }
@@ -1066,6 +1076,8 @@ extension ASRBenchmark {
                 --long-audio-only          Only process files with 4-20 second duration
                 --dump-features            Dump CoreML mel features to JSON (requires --streaming-eou + --single-file)
                 --no-mel-context           Disable 80ms mel-context prepend for long-form batch ASR
+                                           (default: disabled on v3, enabled otherwise)
+                --mel-context              Force-enable the mel-context prepend (v3 opt-in)
                 --encoder-compute-units <u> Encoder placement: ane (default), gpu (~+8% RTFx on Apple Silicon, WER-neutral), cpu, all
                 --help, -h                Show this help message
 
