@@ -506,4 +506,116 @@ final class PhraseBoostingContextTests: XCTestCase {
         XCTAssertTrue(PhraseBoostingFailureReason.jointUnavailable.requiresResourceRepair)
         XCTAssertTrue(PhraseBoostingFailureReason.predictionFailed.requiresResourceRepair)
     }
+
+    // MARK: Phrase weights
+
+    func testPhraseWeightsRejectMismatchedCountAndInvalidValues() {
+        for weights: [Float] in [[1], [1, 1, 1], [1, 0], [1, -0.5], [1, .nan], [1, .infinity]] {
+            XCTAssertThrowsError(
+                try PhraseBoostingContext(
+                    phrases: ["codex", "claude code"],
+                    vocabulary: vocabulary,
+                    blankID: 1_024,
+                    config: PhraseBoostingConfig(),
+                    phraseWeights: weights
+                )
+            ) { error in
+                XCTAssertEqual(error as? PhraseBoostingError, .invalidConfiguration)
+            }
+        }
+    }
+
+    func testPhraseWeightsStayAlignedWhenUnsupportedPhrasesAreSkipped() throws {
+        let skipped = try PhraseBoostingContext(
+            phrases: ["Nguyễn", "codex", "claude code"],
+            vocabulary: vocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig(),
+            phraseWeights: [1, 0.5, 1],
+            skipUnsupportedPhrases: true
+        )
+        let direct = try PhraseBoostingContext(
+            phrases: ["codex", "claude code"],
+            vocabulary: vocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig(),
+            phraseWeights: [0.5, 1]
+        )
+        let misaligned = try PhraseBoostingContext(
+            phrases: ["codex", "claude code"],
+            vocabulary: vocabulary,
+            blankID: 1_024,
+            config: PhraseBoostingConfig(),
+            phraseWeights: [1, 0.5]
+        )
+
+        XCTAssertEqual(skipped.phrases, direct.phrases)
+        var differsFromMisaligned = false
+        var state = skipped.rootState
+        for token in skipped.tokenizedPhrases[0] {
+            let actual = skipped.transition(from: state, token: token)
+            let expected = direct.transition(from: state, token: token)
+            XCTAssertEqual(actual.score, expected.score)
+            XCTAssertEqual(actual.nextState, expected.nextState)
+            if actual.score != misaligned.transition(from: state, token: token).score {
+                differsFromMisaligned = true
+            }
+            state = actual.nextState
+        }
+        XCTAssertTrue(differsFromMisaligned)
+    }
+
+    func testUnitPhraseWeightsMatchOmittedWeights() throws {
+        let phrases = ["codex", "claude code"]
+        let omitted = try PhraseBoostingContext(
+            phrases: phrases, vocabulary: vocabulary, blankID: 1_024, config: PhraseBoostingConfig())
+        let unit = try PhraseBoostingContext(
+            phrases: phrases, vocabulary: vocabulary, blankID: 1_024, config: PhraseBoostingConfig(),
+            phraseWeights: [1, 1])
+        for state in 0..<64 {
+            for token in [-1, 7, 15, 16, 115, 287, 328, 471, 819, 820, 823, 850, 853] {
+                let left = unit.transition(from: state, token: token)
+                let right = omitted.transition(from: state, token: token)
+                XCTAssertEqual(left.score.bitPattern, right.score.bitPattern)
+                XCTAssertEqual(left.nextState, right.nextState)
+            }
+        }
+    }
+
+    /// A weight of r under fusion strength a must choose exactly like weight 1 under r * a,
+    /// so a screen scale is a per-phrase alpha and nothing else.
+    func testPhraseWeightActsLikeAScaledAlphaForThatPhrase() throws {
+        func context(weight: Float, alpha: Float) throws -> PhraseBoostingContext {
+            try PhraseBoostingContext(
+                phrases: ["codex"],
+                vocabulary: vocabulary,
+                blankID: 1_024,
+                config: PhraseBoostingConfig(alpha: alpha),
+                phraseWeights: [weight]
+            )
+        }
+        let weighted = try context(weight: 0.5, alpha: 4)
+        let scaledAlpha = try context(weight: 1, alpha: 2)
+        let unweighted = try context(weight: 1, alpha: 4)
+
+        var weightMattered = false
+        for deficit: Float in [0.25, 0.5, 1, 1.5, 2, 3, 4, 6, 8, 12] {
+            var weightedState = weighted.rootState
+            var scaledState = scaledAlpha.rootState
+            for expected in weighted.tokenizedPhrases[0] {
+                var scores = Array(repeating: Float(-100), count: 1_030)
+                scores[7] = 0
+                scores[expected] = -deficit
+                let left = weighted.select(baseToken: 7, acousticScores: scores, state: weightedState)
+                let right = scaledAlpha.select(baseToken: 7, acousticScores: scores, state: scaledState)
+                XCTAssertEqual(left.token, right.token, "deficit \(deficit)")
+                XCTAssertEqual(left.nextState, right.nextState)
+                let full = unweighted.select(baseToken: 7, acousticScores: scores, state: weightedState)
+                if full.token != left.token { weightMattered = true }
+                weightedState = left.nextState
+                scaledState = right.nextState
+            }
+        }
+        XCTAssertTrue(weightMattered)
+    }
 }

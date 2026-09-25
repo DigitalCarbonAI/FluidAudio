@@ -186,9 +186,11 @@ public actor AsrManager {
     }
 
     /// Prepare an immutable phrase graph once for reuse across transcriptions.
+    /// `phraseWeights`, when given, pairs with `phrases` and scales each phrase's reward.
     public func makePhraseBoostingContext(
         phrases: [String],
         config: PhraseBoostingConfig = PhraseBoostingConfig(),
+        phraseWeights: [Float]? = nil,
         skipUnsupportedPhrases: Bool = false
     ) throws -> PhraseBoostingContext {
         guard asrModels?.version == .v2 else { throw PhraseBoostingError.unsupportedModel }
@@ -200,6 +202,7 @@ public actor AsrManager {
             vocabulary: vocabulary,
             blankID: asrModels?.version.blankId ?? 1_024,
             config: config,
+            phraseWeights: phraseWeights,
             skipUnsupportedPhrases: skipUnsupportedPhrases
         )
     }

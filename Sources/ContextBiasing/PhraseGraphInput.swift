@@ -49,13 +49,19 @@ public struct PhraseGraphConfiguration: Sendable, Equatable {
 public struct PhraseGraphInput: Sendable {
     public let tokens: [Int]
     public let variative: VariativeBPERepresentation?
+    /// Multiplies every per-token reward of this phrase. A weight of 1 is NeMo's graph.
+    /// Callers use a smaller weight for phrases they trust less, such as terms read from
+    /// the screen, without changing the decoder's fusion strength for other phrases.
+    public let weight: Float
 
-    public init(tokens: [Int], variative: VariativeBPERepresentation? = nil) {
+    public init(tokens: [Int], variative: VariativeBPERepresentation? = nil, weight: Float = 1) {
         self.tokens = tokens
         self.variative = variative
+        self.weight = weight
     }
 
     func validate() throws {
+        guard weight.isFinite, weight > 0 else { throw PhraseGraphError.invalidConfiguration }
         guard !tokens.isEmpty, tokens.allSatisfy({ $0 >= 0 }) else {
             throw PhraseGraphError.invalidRepresentation
         }

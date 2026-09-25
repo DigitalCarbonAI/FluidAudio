@@ -35,20 +35,37 @@ public struct PhraseBoostingGraph: Sendable {
     ) throws {
         try config.validate()
         guard !phrases.isEmpty else { throw PhraseGraphError.emptyPhrases }
-        var buildingNodes = [Node()]
-        for (index, phrase) in phrases.enumerated() {
-            if shouldCancel() { throw CancellationError() }
+        for phrase in phrases {
             try phrase.validate()
+        }
+        // A shared prefix node keeps the largest reward of the phrases through it, but a
+        // node's descendants store cumulative scores computed when they were inserted.
+        // Inserting heavier phrases first means a later phrase never raises a prefix whose
+        // descendants already exist, so every stored cumulative score stays consistent and
+        // backoff refunds remain exact. The sort is stable, so equal weights keep the
+        // caller's order and build the same graph as an unweighted list.
+        let insertionOrder = phrases.indices.sorted {
+            phrases[$0].weight > phrases[$1].weight
+                || (phrases[$0].weight == phrases[$1].weight && $0 < $1)
+        }
+        var buildingNodes = [Node()]
+        for index in insertionOrder {
+            if shouldCancel() { throw CancellationError() }
+            let phrase = phrases[index]
             let terminal: Int
             if let representation = phrase.variative {
-                terminal = Self.addVariativePhrase(representation, config: config, to: &buildingNodes)
+                terminal = Self.addVariativePhrase(
+                    representation, weight: phrase.weight, config: config, to: &buildingNodes)
             } else {
-                terminal = Self.addGreedyPhrase(phrase.tokens, config: config, to: &buildingNodes)
+                terminal = Self.addGreedyPhrase(
+                    phrase.tokens, weight: phrase.weight, config: config, to: &buildingNodes)
             }
             buildingNodes[terminal].isEnd = true
             buildingNodes[terminal].phraseIndices.append(index)
         }
         for index in buildingNodes.indices {
+            // Reported indices stay in caller order even when insertion order differs.
+            buildingNodes[index].phraseIndices.sort()
             buildingNodes[index].outputPhraseIndices = buildingNodes[index].phraseIndices
         }
         Self.fillFailureLinks(in: &buildingNodes)
@@ -93,12 +110,13 @@ public struct PhraseBoostingGraph: Sendable {
     }
     private static func addGreedyPhrase(
         _ tokens: [Int],
+        weight: Float,
         config: PhraseGraphConfiguration,
         to nodes: inout [Node]
     ) -> Int {
         var state = 0
         for (depth, token) in tokens.enumerated() {
-            let tokenScore = score(depth: depth, config: config)
+            let tokenScore = score(depth: depth, config: config) * weight
             if let existing = nodes[state].children[token] {
                 let sharedScore = max(tokenScore, nodes[existing].tokenScore)
                 nodes[existing].tokenScore = sharedScore
@@ -127,6 +145,7 @@ public struct PhraseBoostingGraph: Sendable {
     /// total phrase reward.
     private static func addVariativePhrase(
         _ representation: VariativeBPERepresentation,
+        weight: Float,
         config: PhraseGraphConfiguration,
         to nodes: inout [Node]
     ) -> Int {
@@ -140,7 +159,7 @@ public struct PhraseBoostingGraph: Sendable {
         for (depth, canonicalLength) in representation.canonicalLengths.enumerated() {
             let endpoint = offset + canonicalLength - 1
             isPrimaryEndpoint[endpoint] = true
-            let primaryScore = score(depth: depth, config: config)
+            let primaryScore = score(depth: depth, config: config) * weight
             let weights = softmaxWeights(
                 count: canonicalLength,
                 temperature: config.variativeScoringTemperature
