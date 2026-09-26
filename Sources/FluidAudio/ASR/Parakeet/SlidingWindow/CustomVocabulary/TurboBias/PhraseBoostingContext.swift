@@ -149,6 +149,7 @@ public struct PhraseBoostingContext: Sendable {
         vocabulary: [Int: String],
         blankID: Int,
         config: PhraseBoostingConfig,
+        phraseWeights: [Float]? = nil,
         skipUnsupportedPhrases: Bool = false
     ) throws {
         guard config.contextScore.isFinite, config.contextScore >= 0,
@@ -159,6 +160,11 @@ public struct PhraseBoostingContext: Sendable {
             config.variativeScoringTemperature >= 0
         else {
             throw PhraseBoostingError.invalidConfiguration
+        }
+        if let phraseWeights {
+            guard phraseWeights.count == phrases.count,
+                phraseWeights.allSatisfy({ $0.isFinite && $0 > 0 })
+            else { throw PhraseBoostingError.invalidConfiguration }
         }
 
         let normalizedPhrases = phrases.map {
@@ -177,9 +183,10 @@ public struct PhraseBoostingContext: Sendable {
         var acceptedPhrases: [String] = []
         var tokenizedPhrases: [[Int]] = []
         var variativeRepresentations: [VariativeRepresentation?] = []
+        var acceptedWeights: [Float] = []
         var skippedPhrases = 0
         var firstUnsupportedPhrase: String?
-        for phrase in normalizedPhrases {
+        for (phraseIndex, phrase) in normalizedPhrases.enumerated() {
             let tokens: [Int]?
             let representation: VariativeRepresentation?
             if config.caseInsensitive {
@@ -203,6 +210,7 @@ public struct PhraseBoostingContext: Sendable {
             acceptedPhrases.append(phrase)
             tokenizedPhrases.append(tokens)
             variativeRepresentations.append(representation)
+            acceptedWeights.append(phraseWeights?[phraseIndex] ?? 1)
         }
         guard !acceptedPhrases.isEmpty else {
             throw PhraseBoostingError.untokenizablePhrase(firstUnsupportedPhrase ?? "")
@@ -210,7 +218,9 @@ public struct PhraseBoostingContext: Sendable {
 
         let graph = try PhraseBoostingGraph(
             phrases: tokenizedPhrases.indices.map {
-                PhraseGraphInput(tokens: tokenizedPhrases[$0], variative: variativeRepresentations[$0])
+                PhraseGraphInput(
+                    tokens: tokenizedPhrases[$0], variative: variativeRepresentations[$0],
+                    weight: acceptedWeights[$0])
             },
             config: PhraseGraphConfiguration(
                 contextScore: config.contextScore, depthScaling: config.depthScaling,
@@ -392,7 +402,8 @@ public struct PhraseBoostingContext: Sendable {
         return phraseEndBoundaryTokens.contains(tokens[index])
     }
 
-    private func transition(from originalState: Int, token: Int) -> Transition {
+    /// Internal so tests can compare weighted graphs without driving the decoder.
+    func transition(from originalState: Int, token: Int) -> PhraseBoostingGraph.Transition {
         graph.transition(from: originalState, token: token)
     }
 
